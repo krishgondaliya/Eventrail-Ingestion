@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -10,6 +11,24 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
+
+type CreateEventRequest struct {
+	EventType string          `json:"event_type"`
+	Source    string          `json:"source"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+type CreateEventResponse struct {
+	ID string `json:"id"`
+}
+
+type Event struct {
+	ID        string          `json:"id"`
+	EventType string          `json:"event_type"`
+	Source    string          `json:"source"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt time.Time       `json:"created_at"`
+}
 
 func main() {
 	ctx := context.Background()
@@ -28,6 +47,9 @@ func main() {
 	})
 	defer redisClient.Close()
 
+	// --------------------
+	// Health Check
+	// --------------------
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -52,6 +74,90 @@ func main() {
 		w.Write([]byte(
 			`{"status":"` + status + `","postgres":"` + pgStatus + `","redis":"` + redisStatus + `"}`,
 		))
+	})
+
+	// --------------------
+	// POST /events
+	// --------------------
+	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req CreateEventRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		if req.EventType == "" || req.Source == "" || len(req.Payload) == 0 {
+			http.Error(w, "event_type, source, and payload are required", http.StatusBadRequest)
+			return
+		}
+
+		var eventID string
+		err := pgPool.QueryRow(
+			context.Background(),
+			`INSERT INTO events (event_type, source, payload)
+			 VALUES ($1, $2, $3)
+			 RETURNING id`,
+			req.EventType,
+			req.Source,
+			req.Payload,
+		).Scan(&eventID)
+
+		if err != nil {
+			log.Printf("failed to insert event: %v", err)
+			http.Error(w, "failed to persist event", http.StatusInternalServerError)
+			return
+		}
+
+		resp := CreateEventResponse{ID: eventID}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// --------------------
+	// GET /events/{id}
+	// --------------------
+	http.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Expected path: /events/{id}
+		id := r.URL.Path[len("/events/"):]
+		if id == "" {
+			http.Error(w, "event id required", http.StatusBadRequest)
+			return
+		}
+
+		var evt Event
+		err := pgPool.QueryRow(
+			context.Background(),
+			`SELECT id, event_type, source, payload, created_at
+			 FROM events
+			 WHERE id = $1`,
+			id,
+		).Scan(
+			&evt.ID,
+			&evt.EventType,
+			&evt.Source,
+			&evt.Payload,
+			&evt.CreatedAt,
+		)
+
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(evt)
 	})
 
 	log.Println("EventRail API starting on :8080")
