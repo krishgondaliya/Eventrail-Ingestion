@@ -211,21 +211,13 @@ XRANGE eventrail.events.dlq - +
 
 ## Design Guarantees
 
-- ✅ Exactly-once ingestion
-- ✅ At-least-once delivery
-- ✅ Deterministic behavior under retries
-- ✅ Safe recovery after crashes
-- ✅ Replay without downtime
+- Exactly-once ingestion
+- At-least-once delivery
+- Deterministic behavior under retries
+- Safe recovery after crashes
+- Replay without downtime
 
 ---
-
-## Why This Exists
-
-This project was built to demonstrate how real-world event systems are designed:
-
-- No magic
-- No hidden assumptions
-- No hand-waving
 
 **Every failure mode is explicitly handled.**
 
