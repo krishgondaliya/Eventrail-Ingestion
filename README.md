@@ -2,11 +2,23 @@
 
 **Idempotent Event Ingestion & Replay System**
 
-EventRail is a event ingestion and delivery system designed to safely ingest, persist, deliver, retry, and replay events under real-world failure conditions.
-
-It provides idempotency guarantees, durable storage, fan-out delivery, retry with backoff, dead-letter queues, and replay/backfill capabilities using a clean, API-first design.
+EventRail is an event ingestion and delivery system designed to safely ingest, persist, deliver, retry, and replay events under real-world failure conditions. It provides idempotency guarantees, durable storage, fan-out delivery, retry with backoff, dead-letter queues, and replay/backfill capabilities using a clean, API-first design.
 
 > Think of EventRail as a simplified, developer-friendly alternative to internal event pipelines.
+
+---
+
+## Table of Contents
+
+- [Docker Image](#docker-image)
+- [Architecture Overview](#architecture-overview)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Getting Started](#getting-started)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Design Guarantees](#design-guarantees)
+- [License](#license)
 
 ---
 
@@ -16,6 +28,7 @@ EventRail is published as a Docker image via GitHub Container Registry.
 
 ```bash
 docker pull ghcr.io/krishgondaliya/eventrail:latest
+```
 
 ---
 
@@ -59,25 +72,30 @@ Workers
 ## Features
 
 ### Event Ingestion
+
 - API-first REST interface
 - Database-enforced idempotency using `Idempotency-Key`
 - Safe under retries, crashes, and concurrent requests
 
 ### Durable Storage
+
 - PostgreSQL as the authoritative event store
 - Indexed for time-range queries and replay
 
 ### Delivery & Fan-out
+
 - Redis Streams for append-only delivery
 - Consumer groups for fan-out
 - Per-consumer offsets tracked by Redis
 
 ### Failure Handling
+
 - Automatic retries with exponential backoff
 - Configurable retry limits
 - Dead-letter queue for permanently failed events
 
 ### Replay & Backfill
+
 - Replay events by time range
 - Reset consumer offsets to reprocess history
 - No downtime required
@@ -101,6 +119,7 @@ Workers
 ### Prerequisites
 
 Make sure you have:
+
 - Docker
 - Docker Compose
 - Git
@@ -225,8 +244,6 @@ XRANGE eventrail.events.dlq - +
 - Deterministic behavior under retries
 - Safe recovery after crashes
 - Replay without downtime
-
----
 
 **Every failure mode is explicitly handled.**
 
