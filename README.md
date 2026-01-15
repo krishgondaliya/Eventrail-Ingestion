@@ -8,6 +8,8 @@ It provides idempotency guarantees, durable storage, fan-out delivery, retry wit
 
 > Think of EventRail as a simplified, developer-friendly alternative to internal event pipelines.
 
+---
+
 ## Docker Image
 
 EventRail is published as a Docker image via GitHub Container Registry.
