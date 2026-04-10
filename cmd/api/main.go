@@ -174,6 +174,7 @@ func main() {
 				"event_id":   eventID,
 				"event_type": req.EventType,
 				"source":     req.Source,
+				"payload":    string(req.Payload),
 				"retry":      "0",
 				"created_at": time.Now().UTC().Format(time.RFC3339),
 			},
@@ -267,7 +268,7 @@ func main() {
 		}
 
 		query := `
-			SELECT id, event_type, source, created_at
+			SELECT id, event_type, source, payload, created_at
 			FROM events
 			WHERE created_at >= $1 AND created_at <= $2`
 		args := []interface{}{fromT, toT}
@@ -298,8 +299,9 @@ func main() {
 		published := 0
 		for rows.Next() {
 			var id, eventType, source string
+			var payload []byte
 			var createdAt time.Time
-			if err := rows.Scan(&id, &eventType, &source, &createdAt); err != nil {
+			if err := rows.Scan(&id, &eventType, &source, &payload, &createdAt); err != nil {
 				http.Error(w, "failed to read events", http.StatusInternalServerError)
 				return
 			}
@@ -310,6 +312,7 @@ func main() {
 					"event_id":   id,
 					"event_type": eventType,
 					"source":     source,
+					"payload":    string(payload),
 					"retry":      "0",
 					"created_at": createdAt.UTC().Format(time.RFC3339),
 					"replay":     "1",
@@ -439,6 +442,49 @@ func processMessage(msg redis.XMessage) error {
 	if et == "force.fail" {
 		return errors.New("forced failure for testing")
 	}
+
+	if et == "webhook" {
+		payloadStr, ok := msg.Values["payload"].(string)
+		if !ok {
+			return errors.New("webhook event missing payload")
+		}
+
+		var payloadData struct {
+			URL  string `json:"url"`
+			Data any    `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(payloadStr), &payloadData); err != nil {
+			return errors.New("invalid webhook payload: " + err.Error())
+		}
+
+		if payloadData.URL == "" {
+			return errors.New("webhook url is required")
+		}
+
+		bodyBytes, err := json.Marshal(payloadData.Data)
+		if err != nil {
+			return errors.New("failed to marshal webhook data: " + err.Error())
+		}
+
+		req, err := http.NewRequest(http.MethodPost, payloadData.URL, strings.NewReader(string(bodyBytes)))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			return errors.New("webhook failed with status: " + resp.Status)
+		}
+		log.Printf("webhook delivered successfully to %s", payloadData.URL)
+	}
+
 	return nil
 }
 
