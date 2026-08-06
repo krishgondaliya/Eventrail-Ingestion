@@ -13,8 +13,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/broker/redisstream"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/outbox"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -27,6 +29,10 @@ const (
 	DefaultWorker      = "api-1"
 	DefaultMaxRetries  = 5
 	DefaultBaseBackoff = 500 * time.Millisecond
+
+	DefaultOutboxPollInterval = 250 * time.Millisecond
+	DefaultOutboxBaseBackoff  = 500 * time.Millisecond
+	DefaultOutboxMaxBackoff   = 30 * time.Second
 )
 
 type Event struct {
@@ -67,6 +73,7 @@ func main() {
 
 	maxRetries := envInt("MAX_RETRIES", DefaultMaxRetries)
 	baseBackoff := envDuration("BASE_BACKOFF_MS", DefaultBaseBackoff)
+	outboxPollInterval := envDuration("OUTBOX_POLL_INTERVAL_MS", DefaultOutboxPollInterval)
 
 	pgPool, err := pgxpool.New(ctx, pgDSN)
 	if err != nil {
@@ -82,6 +89,39 @@ func main() {
 	if err := ensureConsumerGroup(ctx, redisClient); err != nil {
 		log.Fatalf("failed to ensure consumer group: %v", err)
 	}
+
+	streamPublisher, err := redisstream.NewPublisher(redisClient, EventStream)
+	if err != nil {
+		log.Fatalf("create Redis stream publisher: %v", err)
+	}
+
+	publishNext := func(ctx context.Context) (outbox.PublishNextOutboxResult, error) {
+		return outbox.PublishNextOutboxEvent(
+			ctx,
+			pgPool,
+			streamPublisher.Publish,
+			DefaultOutboxBaseBackoff,
+			DefaultOutboxMaxBackoff,
+		)
+	}
+
+	outboxRunner, err := outbox.NewRunner(
+		publishNext,
+		outboxPollInterval,
+		func(err error) {
+			log.Printf("outbox publisher error: %v", err)
+		},
+	)
+	if err != nil {
+		log.Fatalf("create outbox runner: %v", err)
+	}
+
+	go func() {
+		log.Println("outbox publisher started")
+		if err := outboxRunner.Run(ctx); err != nil {
+			log.Printf("outbox publisher stopped with error: %v", err)
+		}
+	}()
 
 	// Worker reads stream, processes, acks, schedules retries, moves to DLQ
 	go startStreamWorker(redisClient, consumer, maxRetries, baseBackoff)
