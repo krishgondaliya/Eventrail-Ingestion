@@ -8,10 +8,14 @@ import (
 )
 
 type FailureKind string
+type FailureAction string
 
 const (
 	FailureRetryable FailureKind = "retryable"
 	FailurePermanent FailureKind = "permanent"
+
+	FailureActionRetry      FailureAction = "retry"
+	FailureActionDeadLetter FailureAction = "dead_letter"
 )
 
 type Failure struct {
@@ -112,4 +116,14 @@ func ClassifyHTTPStatus(statusCode int) FailureKind {
 		return FailurePermanent
 	}
 	return ""
+}
+
+func DecideFailureAction(err error, retryCount int, maxRetries int) FailureAction {
+	if IsPermanent(err) {
+		return FailureActionDeadLetter
+	}
+	if retryCount < maxRetries {
+		return FailureActionRetry
+	}
+	return FailureActionDeadLetter
 }

@@ -101,3 +101,58 @@ func TestFailureErrorDoesNotIncludeExternalPayloadSecret(t *testing.T) {
 		t.Fatalf("failure error leaked payload secret: %q", err.Error())
 	}
 }
+
+func TestDecideFailureAction(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		retryCount int
+		maxRetries int
+		want       FailureAction
+	}{
+		{
+			name:       "permanent goes directly to DLQ",
+			err:        NewPermanentFailure(errors.New("bad request")),
+			retryCount: 0,
+			maxRetries: 5,
+			want:       FailureActionDeadLetter,
+		},
+		{
+			name:       "retryable below limit retries",
+			err:        NewRetryableFailure(errors.New("timeout")),
+			retryCount: 4,
+			maxRetries: 5,
+			want:       FailureActionRetry,
+		},
+		{
+			name:       "retryable at limit goes to DLQ",
+			err:        NewRetryableFailure(errors.New("timeout")),
+			retryCount: 5,
+			maxRetries: 5,
+			want:       FailureActionDeadLetter,
+		},
+		{
+			name:       "unknown below limit retries",
+			err:        errors.New("unknown"),
+			retryCount: 0,
+			maxRetries: 1,
+			want:       FailureActionRetry,
+		},
+		{
+			name:       "unknown at limit goes to DLQ",
+			err:        errors.New("unknown"),
+			retryCount: 1,
+			maxRetries: 1,
+			want:       FailureActionDeadLetter,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DecideFailureAction(tt.err, tt.retryCount, tt.maxRetries)
+			if got != tt.want {
+				t.Fatalf("expected %q, got %q", tt.want, got)
+			}
+		})
+	}
+}

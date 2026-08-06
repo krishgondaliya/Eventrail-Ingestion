@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/testutil"
 )
 
@@ -97,6 +98,8 @@ func TestPersistEventWithOutboxIntegrationNewKeyedEvent(t *testing.T) {
 	if outbox.PublishedAt.Valid {
 		t.Fatalf("expected published_at null, got %v", outbox.PublishedAt.Time)
 	}
+	assertEventStatusCount(t, pool, result.EventID, operations.StatusStored, 1)
+	assertEventStatusCount(t, pool, result.EventID, operations.StatusPendingPublication, 1)
 }
 
 func TestPersistEventWithOutboxIntegrationIdenticalRetry(t *testing.T) {
@@ -145,6 +148,8 @@ func TestPersistEventWithOutboxIntegrationIdenticalRetry(t *testing.T) {
 	}
 	event := fetchStoredEvent(t, pool, first.EventID)
 	assertJSONEqual(t, event.Payload, string(firstReq.Payload))
+	assertEventStatusCount(t, pool, first.EventID, operations.StatusStored, 1)
+	assertEventStatusCount(t, pool, first.EventID, operations.StatusPendingPublication, 1)
 }
 
 func TestPersistEventWithOutboxIntegrationConflictingRetry(t *testing.T) {
@@ -188,6 +193,8 @@ func TestPersistEventWithOutboxIntegrationConflictingRetry(t *testing.T) {
 	}
 	event := fetchStoredEvent(t, pool, first.EventID)
 	assertJSONEqual(t, event.Payload, string(firstReq.Payload))
+	assertEventStatusCount(t, pool, first.EventID, operations.StatusStored, 1)
+	assertEventStatusCount(t, pool, first.EventID, operations.StatusPendingPublication, 1)
 }
 
 func TestPersistEventWithOutboxIntegrationNoKeyCreatesIndependentEvents(t *testing.T) {
@@ -441,6 +448,23 @@ func fetchStoredOutbox(t *testing.T, pool *pgxpool.Pool, eventID string) storedO
 		t.Fatalf("fetch outbox row for event %s: %v", eventID, err)
 	}
 	return outbox
+}
+
+func assertEventStatusCount(t *testing.T, pool *pgxpool.Pool, eventID string, status string, want int) {
+	t.Helper()
+
+	var got int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT count(*) FROM event_status_history WHERE event_id = $1::uuid AND status = $2`,
+		eventID,
+		status,
+	).Scan(&got); err != nil {
+		t.Fatalf("count status %s for event %s: %v", status, eventID, err)
+	}
+	if got != want {
+		t.Fatalf("expected %d %s statuses for event %s, got %d", want, status, eventID, got)
+	}
 }
 
 func assertJSONEqual(t *testing.T, got string, want string) {

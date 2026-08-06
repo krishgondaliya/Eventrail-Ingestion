@@ -4,21 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/broker/redisstream"
-	"github.com/krishgondaliya/eventrail-ingestion/internal/delivery"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/config"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/deliveryworker"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/outbox"
+	"github.com/krishgondaliya/eventrail-ingestion/migrations"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -28,13 +32,14 @@ const (
 	DLQStream     = "eventrail.events.dlq"
 	RetryZSet     = "eventrail.events.retry" // delayed retry scheduler (ZSET)
 
-	DefaultWorker      = "api-1"
-	DefaultMaxRetries  = 5
-	DefaultBaseBackoff = 500 * time.Millisecond
+	DefaultOutboxBaseBackoff = 500 * time.Millisecond
+	DefaultOutboxMaxBackoff  = 30 * time.Second
+)
 
-	DefaultOutboxPollInterval = 250 * time.Millisecond
-	DefaultOutboxBaseBackoff  = 500 * time.Millisecond
-	DefaultOutboxMaxBackoff   = 30 * time.Second
+var (
+	version = "dev"
+	commit  = "unknown"
+	builtAt = "unknown"
 )
 
 type Event struct {
@@ -46,16 +51,35 @@ type Event struct {
 }
 
 type ReplayRequest struct {
-	From      string `json:"from"`       // RFC3339
-	To        string `json:"to"`         // RFC3339
-	Source    string `json:"source"`     // optional
-	EventType string `json:"event_type"` // optional
-	Limit     int    `json:"limit"`      // optional, default 1000
+	From      string        `json:"from"`       // RFC3339
+	To        string        `json:"to"`         // RFC3339
+	Source    string        `json:"source"`     // optional
+	EventType string        `json:"event_type"` // optional
+	Limit     int           `json:"limit"`      // optional, default 1000
+	Cursor    *ReplayCursor `json:"cursor"`     // optional
 }
 
 type ReplayResponse struct {
-	Published int `json:"published"`
+	Published  int           `json:"published"`
+	HasMore    bool          `json:"has_more"`
+	NextCursor *ReplayCursor `json:"next_cursor,omitempty"`
 }
+
+type ReplayCursor struct {
+	CreatedAt string `json:"created_at"`
+	EventID   string `json:"event_id"`
+}
+
+type replayRows interface {
+	Close()
+	Err() error
+	Next() bool
+	Scan(dest ...any) error
+}
+
+type replayQueryFunc func(ctx context.Context, query string, args ...any) (replayRows, error)
+
+type replayPublishFunc func(ctx context.Context, values map[string]interface{}) (string, error)
 
 type SetGroupCursorRequest struct {
 	Group   string `json:"group"`    // optional, default ConsumerGroup
@@ -63,32 +87,49 @@ type SetGroupCursorRequest struct {
 }
 
 func main() {
-	ctx := context.Background()
+	signalCtx, stopSignals := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stopSignals()
 
-	pgDSN := os.Getenv("POSTGRES_DSN")
-	redisAddr := os.Getenv("REDIS_ADDR")
+	ctx, cancelApp := context.WithCancel(context.Background())
+	defer cancelApp()
 
-	consumer := strings.TrimSpace(os.Getenv("CONSUMER_NAME"))
-	if consumer == "" {
-		consumer = DefaultWorker
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("invalid configuration: %v", err)
 	}
 
-	maxRetries := envInt("MAX_RETRIES", DefaultMaxRetries)
-	baseBackoff := envDuration("BASE_BACKOFF_MS", DefaultBaseBackoff)
-	outboxPollInterval := envDuration("OUTBOX_POLL_INTERVAL_MS", DefaultOutboxPollInterval)
-
-	pgPool, err := pgxpool.New(ctx, pgDSN)
+	pgPool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
 		log.Fatalf("failed to connect to postgres: %v", err)
 	}
 	defer pgPool.Close()
 
+	if err := migrations.Apply(ctx, pgPool); err != nil {
+		log.Fatalf("failed to apply PostgreSQL migrations: %v", err)
+	}
+	operationsStore := operations.NewStore(pgPool)
+	aiTriageClient := httpapi.NewAITriageClient(cfg.AIServiceURL, nil)
+
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
+		Addr: cfg.RedisAddr,
 	})
 	defer redisClient.Close()
 
-	if err := ensureConsumerGroup(ctx, redisClient); err != nil {
+	deliveryWorker := deliveryworker.New(redisClient, deliveryworker.Config{
+		Stream:        EventStream,
+		ConsumerGroup: ConsumerGroup,
+		Consumer:      cfg.ConsumerName,
+		DLQStream:     DLQStream,
+		RetryZSet:     RetryZSet,
+		MaxRetries:    cfg.MaxRetries,
+		BaseBackoff:   cfg.BaseBackoff,
+		Recorder:      operationsStore,
+	})
+	if err := deliveryWorker.EnsureConsumerGroup(ctx); err != nil {
 		log.Fatalf("failed to ensure consumer group: %v", err)
 	}
 
@@ -109,7 +150,7 @@ func main() {
 
 	outboxRunner, err := outbox.NewRunner(
 		publishNext,
-		outboxPollInterval,
+		cfg.OutboxPollInterval,
 		func(err error) {
 			log.Printf("outbox publisher error: %v", err)
 		},
@@ -118,47 +159,52 @@ func main() {
 		log.Fatalf("create outbox runner: %v", err)
 	}
 
+	var workers sync.WaitGroup
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		log.Println("outbox publisher started")
 		if err := outboxRunner.Run(ctx); err != nil {
 			log.Printf("outbox publisher stopped with error: %v", err)
 		}
 	}()
 
-	// Worker reads stream, processes, acks, schedules retries, moves to DLQ
-	go startStreamWorker(redisClient, consumer, maxRetries, baseBackoff)
-
-	// Retry pump pulls due items from ZSET and republishes them to the stream
-	go retryPump(redisClient)
-
-	// --------------------
-	// Health Check
-	// --------------------
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		hctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-
-		pgStatus := "ok"
-		if err := pgPool.Ping(hctx); err != nil {
-			pgStatus = "error"
+	// Worker reads stream, reclaims pending messages, processes delivery, retries, and DLQs.
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		if err := deliveryWorker.Run(ctx); err != nil {
+			log.Printf("delivery worker stopped with error: %v", err)
 		}
+	}()
 
-		redisStatus := "ok"
-		if err := redisClient.Ping(hctx).Err(); err != nil {
-			redisStatus = "error"
-		}
+	readinessHandler := httpapi.NewReadinessHandler(
+		func(ctx context.Context) error {
+			return pgPool.Ping(ctx)
+		},
+		func(ctx context.Context) error {
+			return redisClient.Ping(ctx).Err()
+		},
+	)
+	mux := http.NewServeMux()
 
-		status := "ok"
-		if pgStatus != "ok" || redisStatus != "ok" {
-			status = "degraded"
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(
-			`{"status":"` + status + `","postgres":"` + pgStatus + `","redis":"` + redisStatus + `"}`,
-		))
-	})
+	mux.Handle("/health/live", httpapi.NewLivenessHandler())
+	mux.Handle("/health/ready", readinessHandler)
+	mux.Handle("/health", readinessHandler)
+	mux.Handle("/version", httpapi.NewVersionHandler("eventrail-api", version, commit, builtAt))
+	mux.Handle("/dlq", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
+		return redisClient.XAdd(ctx, &redis.XAddArgs{
+			Stream: EventStream,
+			Values: values,
+		}).Result()
+	}, aiTriageClient))
+	mux.Handle("/dlq/", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
+		return redisClient.XAdd(ctx, &redis.XAddArgs{
+			Stream: EventStream,
+			Values: values,
+		}).Result()
+	}, aiTriageClient))
+	mux.Handle("/metrics/summary", httpapi.NewMetricsSummaryHandler(operationsStore))
 
 	persist := func(
 		ctx context.Context,
@@ -167,13 +213,20 @@ func main() {
 	) (ingestion.PersistResult, error) {
 		return ingestion.PersistEventWithOutbox(ctx, pgPool, input, idempotencyKey)
 	}
-	http.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
+	mux.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
+	eventStatusHandler := httpapi.NewEventStatusHandler(operationsStore)
 
 	// --------------------
 	// GET /events/{id}
 	// --------------------
-	http.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") {
+			eventStatusHandler.ServeHTTP(w, r)
+			return
+		}
+
 		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -186,7 +239,7 @@ func main() {
 
 		var evt Event
 		err := pgPool.QueryRow(
-			context.Background(),
+			r.Context(),
 			`SELECT id, event_type, source, payload, created_at
 			 FROM events WHERE id = $1`,
 			id,
@@ -211,116 +264,34 @@ func main() {
 		json.NewEncoder(w).Encode(evt)
 	})
 
-	// --------------------
-	// POST /replay (backfill by time range from Postgres into Redis Stream)
-	// --------------------
-	http.HandleFunc("/replay", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req ReplayRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
-			return
-		}
-
-		if req.From == "" || req.To == "" {
-			http.Error(w, "from and to are required (RFC3339)", http.StatusBadRequest)
-			return
-		}
-
-		fromT, err := time.Parse(time.RFC3339, req.From)
-		if err != nil {
-			http.Error(w, "from must be RFC3339", http.StatusBadRequest)
-			return
-		}
-		toT, err := time.Parse(time.RFC3339, req.To)
-		if err != nil {
-			http.Error(w, "to must be RFC3339", http.StatusBadRequest)
-			return
-		}
-
-		limit := req.Limit
-		if limit <= 0 || limit > 5000 {
-			limit = 1000
-		}
-
-		query := `
-			SELECT id, event_type, source, payload, created_at
-			FROM events
-			WHERE created_at >= $1 AND created_at <= $2`
-		args := []interface{}{fromT, toT}
-
-		if req.Source != "" {
-			query += " AND source = $3"
-			args = append(args, req.Source)
-		}
-
-		if req.EventType != "" {
-			if req.Source != "" {
-				query += " AND event_type = $4"
-			} else {
-				query += " AND event_type = $3"
-			}
-			args = append(args, req.EventType)
-		}
-
-		query += " ORDER BY created_at ASC LIMIT " + strconv.Itoa(limit)
-
-		rows, err := pgPool.Query(context.Background(), query, args...)
-		if err != nil {
-			http.Error(w, "failed to query events", http.StatusInternalServerError)
-			return
-		}
-		defer rows.Close()
-
-		published := 0
-		for rows.Next() {
-			var id, eventType, source string
-			var payload []byte
-			var createdAt time.Time
-			if err := rows.Scan(&id, &eventType, &source, &payload, &createdAt); err != nil {
-				http.Error(w, "failed to read events", http.StatusInternalServerError)
-				return
-			}
-
-			_, err := redisClient.XAdd(context.Background(), &redis.XAddArgs{
+	mux.HandleFunc("/replay", newReplayHandler(
+		func(ctx context.Context, query string, args ...any) (replayRows, error) {
+			return pgPool.Query(ctx, query, args...)
+		},
+		func(ctx context.Context, values map[string]interface{}) (string, error) {
+			return redisClient.XAdd(ctx, &redis.XAddArgs{
 				Stream: EventStream,
-				Values: map[string]interface{}{
-					"event_id":   id,
-					"event_type": eventType,
-					"source":     source,
-					"payload":    string(payload),
-					"retry":      "0",
-					"created_at": createdAt.UTC().Format(time.RFC3339),
-					"replay":     "1",
-				},
+				Values: values,
 			}).Result()
-			if err != nil {
-				log.Printf("replay publish failed for %s: %v", id, err)
-				continue
-			}
-			published++
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ReplayResponse{Published: published})
-	})
+		},
+	))
 
 	// --------------------
 	// POST /consumer-groups/set-cursor (consumer replay)
 	// Sets the group cursor so consumers can reprocess history.
 	// --------------------
-	http.HandleFunc("/consumer-groups/set-cursor", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/consumer-groups/set-cursor", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 
 		var req SetGroupCursorRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := httpapi.DecodeJSONRequest(w, r, &req); err != nil {
+			if httpapi.IsRequestBodyTooLarge(err) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
 		}
@@ -336,7 +307,7 @@ func main() {
 			return
 		}
 
-		if err := redisClient.XGroupSetID(context.Background(), EventStream, group, startID).Err(); err != nil {
+		if err := redisClient.XGroupSetID(r.Context(), EventStream, group, startID).Err(); err != nil {
 			http.Error(w, "failed to set group cursor", http.StatusInternalServerError)
 			return
 		}
@@ -344,257 +315,47 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	log.Println("EventRail API starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func ensureConsumerGroup(ctx context.Context, rdb *redis.Client) error {
-	err := rdb.XGroupCreateMkStream(ctx, EventStream, ConsumerGroup, "0").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		return err
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           httpapi.WithCORS(mux, dashboardOrigins()),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
-	return nil
-}
 
-func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseBackoff time.Duration) {
-	ctx := context.Background()
-	log.Printf("stream worker started (group=%s consumer=%s)", ConsumerGroup, consumer)
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Println("EventRail API starting on :8080")
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
 
-	for {
-		res, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    ConsumerGroup,
-			Consumer: consumer,
-			Streams:  []string{EventStream, ">"},
-			Count:    10,
-			Block:    5 * time.Second,
-		}).Result()
-
+	select {
+	case <-signalCtx.Done():
+		log.Println("shutdown signal received")
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown failed: %v", err)
+		}
+		cancelShutdown()
+		cancelApp()
+		workers.Wait()
+	case err := <-serverErr:
 		if err != nil {
-			if err == redis.Nil {
-				continue
-			}
-			log.Printf("XREADGROUP error: %v", err)
-			time.Sleep(500 * time.Millisecond)
-			continue
+			log.Printf("HTTP server stopped with error: %v", err)
 		}
-
-		for _, stream := range res {
-			for _, msg := range stream.Messages {
-				retry := parseRetry(msg.Values["retry"])
-
-				if err := processMessage(msg); err != nil {
-					// failure path
-					// Phase 3B will use delivery.IsPermanent to bypass retries safely.
-					nextRetry := retry + 1
-					if nextRetry > maxRetries {
-						moveToDLQ(ctx, rdb, msg, err)
-						_ = rdb.XAck(ctx, EventStream, ConsumerGroup, msg.ID).Err()
-						continue
-					}
-
-					delay := backoffDelay(baseBackoff, nextRetry)
-					if err := scheduleRetry(ctx, rdb, msg, nextRetry, delay); err != nil {
-						// If scheduling fails, keep it unacked so it stays pending.
-						log.Printf("schedule retry failed (msg=%s): %v", msg.ID, err)
-						continue
-					}
-
-					// Once scheduled, ack original so it doesn't sit in pending forever
-					_ = rdb.XAck(ctx, EventStream, ConsumerGroup, msg.ID).Err()
-					continue
-				}
-
-				// success
-				log.Printf("processed event stream_id=%s event_id=%v type=%v source=%v retry=%d",
-					msg.ID, msg.Values["event_id"], msg.Values["event_type"], msg.Values["source"], retry)
-
-				if err := rdb.XAck(ctx, EventStream, ConsumerGroup, msg.ID).Err(); err != nil {
-					log.Printf("XACK error: %v", err)
-				}
-			}
-		}
+		cancelApp()
+		workers.Wait()
 	}
 }
 
-// processMessage is where delivery work happens.
-// For testing retries, if event_type == "force.fail" we fail intentionally.
-func processMessage(msg redis.XMessage) error {
-	et, _ := msg.Values["event_type"].(string)
-	if et == "force.fail" {
-		return delivery.NewRetryableFailure(errors.New("forced failure for testing"))
+func dashboardOrigins() []string {
+	return []string{
+		"http://localhost:5173",
+		"http://127.0.0.1:5173",
 	}
-
-	if et == "webhook" {
-		return processWebhookMessage(msg, &http.Client{Timeout: 10 * time.Second})
-	}
-
-	return nil
-}
-
-func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
-	payloadStr, ok := msg.Values["payload"].(string)
-	if !ok {
-		return delivery.NewPermanentFailure(errors.New("webhook event missing payload"))
-	}
-
-	var payloadData struct {
-		URL  string `json:"url"`
-		Data any    `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(payloadStr), &payloadData); err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("invalid webhook payload: %w", err))
-	}
-
-	if payloadData.URL == "" {
-		return delivery.NewPermanentFailure(errors.New("webhook url is required"))
-	}
-
-	bodyBytes, err := json.Marshal(payloadData.Data)
-	if err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("failed to marshal webhook data: %w", err))
-	}
-
-	req, err := http.NewRequest(http.MethodPost, payloadData.URL, strings.NewReader(string(bodyBytes)))
-	if err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("create webhook request: %w", err))
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return delivery.NewRetryableFailure(fmt.Errorf("deliver webhook request: %w", err))
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return delivery.NewHTTPFailure(resp.StatusCode, resp.Status)
-	}
-
-	log.Printf("webhook delivered successfully to %s", payloadData.URL)
-	return nil
-}
-
-func scheduleRetry(ctx context.Context, rdb *redis.Client, msg redis.XMessage, nextRetry int, delay time.Duration) error {
-	// We store the full Values as JSON in a ZSET member so we can re-publish later.
-	values := msg.Values
-	values["retry"] = strconv.Itoa(nextRetry)
-	values["original_stream_id"] = msg.ID
-
-	b, err := json.Marshal(values)
-	if err != nil {
-		return err
-	}
-
-	due := time.Now().Add(delay).UnixMilli()
-	return rdb.ZAdd(ctx, RetryZSet, redis.Z{
-		Score:  float64(due),
-		Member: string(b),
-	}).Err()
-}
-
-func retryPump(rdb *redis.Client) {
-	ctx := context.Background()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		now := time.Now().UnixMilli()
-
-		members, err := rdb.ZRangeByScore(ctx, RetryZSet, &redis.ZRangeBy{
-			Min:    "-inf",
-			Max:    strconv.FormatInt(now, 10),
-			Offset: 0,
-			Count:  50,
-		}).Result()
-		if err != nil || len(members) == 0 {
-			continue
-		}
-
-		for _, m := range members {
-			// Remove first to avoid double-publish on crash loops
-			removed, _ := rdb.ZRem(ctx, RetryZSet, m).Result()
-			if removed == 0 {
-				continue
-			}
-
-			var values map[string]interface{}
-			if err := json.Unmarshal([]byte(m), &values); err != nil {
-				continue
-			}
-
-			_, err := rdb.XAdd(ctx, &redis.XAddArgs{
-				Stream: EventStream,
-				Values: values,
-			}).Result()
-			if err != nil {
-				// If republish fails, put it back with a short delay
-				_ = rdb.ZAdd(ctx, RetryZSet, redis.Z{
-					Score:  float64(time.Now().Add(1 * time.Second).UnixMilli()),
-					Member: m,
-				}).Err()
-			}
-		}
-	}
-}
-
-func moveToDLQ(ctx context.Context, rdb *redis.Client, msg redis.XMessage, cause error) {
-	values := msg.Values
-	values["dlq_at"] = time.Now().UTC().Format(time.RFC3339)
-	values["error"] = cause.Error()
-	values["original_stream_id"] = msg.ID
-
-	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: DLQStream,
-		Values: values,
-	}).Result()
-	if err != nil {
-		log.Printf("failed to write to DLQ: %v", err)
-	}
-}
-
-func parseRetry(v interface{}) int {
-	s, ok := v.(string)
-	if !ok {
-		return 0
-	}
-	i, err := strconv.Atoi(s)
-	if err != nil {
-		return 0
-	}
-	return i
-}
-
-func backoffDelay(base time.Duration, retry int) time.Duration {
-	// Exponential backoff: base * 2^(retry-1), capped
-	mult := 1 << (retry - 1)
-	d := time.Duration(mult) * base
-	if d > 10*time.Second {
-		return 10 * time.Second
-	}
-	return d
-}
-
-func envInt(key string, def int) int {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return def
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil {
-		return def
-	}
-	return v
-}
-
-// BASE_BACKOFF_MS is an int in milliseconds
-func envDuration(key string, def time.Duration) time.Duration {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return def
-	}
-	ms, err := strconv.Atoi(raw)
-	if err != nil {
-		return def
-	}
-	return time.Duration(ms) * time.Millisecond
 }
