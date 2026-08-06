@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -15,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/broker/redisstream"
-	"github.com/krishgondaliya/eventrail-ingestion/internal/delivery"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/deliveryworker"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/outbox"
@@ -35,9 +33,6 @@ const (
 	DefaultOutboxPollInterval = 250 * time.Millisecond
 	DefaultOutboxBaseBackoff  = 500 * time.Millisecond
 	DefaultOutboxMaxBackoff   = 30 * time.Second
-
-	PendingClaimIdle  = 30 * time.Second
-	PendingClaimCount = 10
 )
 
 type Event struct {
@@ -91,7 +86,16 @@ func main() {
 	})
 	defer redisClient.Close()
 
-	if err := ensureConsumerGroup(ctx, redisClient); err != nil {
+	deliveryWorker := deliveryworker.New(redisClient, deliveryworker.Config{
+		Stream:        EventStream,
+		ConsumerGroup: ConsumerGroup,
+		Consumer:      consumer,
+		DLQStream:     DLQStream,
+		RetryZSet:     RetryZSet,
+		MaxRetries:    maxRetries,
+		BaseBackoff:   baseBackoff,
+	})
+	if err := deliveryWorker.EnsureConsumerGroup(ctx); err != nil {
 		log.Fatalf("failed to ensure consumer group: %v", err)
 	}
 
@@ -128,11 +132,8 @@ func main() {
 		}
 	}()
 
-	// Worker reads stream, processes, acks, schedules retries, moves to DLQ
-	go startStreamWorker(redisClient, consumer, maxRetries, baseBackoff)
-
-	// Retry pump pulls due items from ZSET and republishes them to the stream
-	go retryPump(redisClient)
+	// Worker reads stream, reclaims pending messages, processes delivery, retries, and DLQs.
+	go deliveryWorker.Run(context.Background())
 
 	// --------------------
 	// Health Check
@@ -349,361 +350,6 @@ func main() {
 
 	log.Println("EventRail API starting on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func ensureConsumerGroup(ctx context.Context, rdb *redis.Client) error {
-	err := rdb.XGroupCreateMkStream(ctx, EventStream, ConsumerGroup, "0").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		return err
-	}
-	return nil
-}
-
-func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseBackoff time.Duration) {
-	ctx := context.Background()
-	log.Printf("stream worker started (group=%s consumer=%s)", ConsumerGroup, consumer)
-
-	for {
-		reclaimed, err := reclaimPendingMessagesForConsumer(
-			ctx,
-			rdb,
-			EventStream,
-			ConsumerGroup,
-			consumer,
-			PendingClaimIdle,
-			PendingClaimCount,
-		)
-		if err != nil {
-			log.Printf("XAUTOCLAIM error: %v", err)
-		}
-		for _, msg := range reclaimed {
-			processStreamMessage(ctx, rdb, msg, maxRetries, baseBackoff)
-		}
-
-		res, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    ConsumerGroup,
-			Consumer: consumer,
-			Streams:  []string{EventStream, ">"},
-			Count:    10,
-			Block:    5 * time.Second,
-		}).Result()
-
-		if err != nil {
-			if err == redis.Nil {
-				continue
-			}
-			log.Printf("XREADGROUP error: %v", err)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
-		for _, stream := range res {
-			for _, msg := range stream.Messages {
-				processStreamMessage(ctx, rdb, msg, maxRetries, baseBackoff)
-			}
-		}
-	}
-}
-
-func reclaimPendingMessages(
-	ctx context.Context,
-	client *redis.Client,
-	consumer string,
-) ([]redis.XMessage, error) {
-	return reclaimPendingMessagesForConsumer(
-		ctx,
-		client,
-		EventStream,
-		ConsumerGroup,
-		consumer,
-		PendingClaimIdle,
-		PendingClaimCount,
-	)
-}
-
-func reclaimPendingMessagesForConsumer(
-	ctx context.Context,
-	client *redis.Client,
-	stream string,
-	group string,
-	consumer string,
-	minIdle time.Duration,
-	count int64,
-) ([]redis.XMessage, error) {
-	messages, _, err := client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-		Stream:   stream,
-		Group:    group,
-		Consumer: consumer,
-		MinIdle:  minIdle,
-		Start:    "0-0",
-		Count:    count,
-	}).Result()
-	if err == redis.Nil {
-		return nil, nil
-	}
-	return messages, err
-}
-
-func processStreamMessage(ctx context.Context, rdb *redis.Client, msg redis.XMessage, maxRetries int, baseBackoff time.Duration) {
-	retry := parseRetry(msg.Values["retry"])
-
-	if err := processMessage(msg); err != nil {
-		if err := handleDeliveryFailure(
-			ctx,
-			msg,
-			err,
-			retry,
-			maxRetries,
-			baseBackoff,
-			func(ctx context.Context, msg redis.XMessage, nextRetry int, delay time.Duration) error {
-				return scheduleRetry(ctx, rdb, msg, nextRetry, delay)
-			},
-			func(ctx context.Context, msg redis.XMessage, cause error) error {
-				return moveToDLQ(ctx, rdb, msg, cause)
-			},
-			func(ctx context.Context, messageID string) error {
-				return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
-			},
-		); err != nil {
-			log.Printf("delivery failure handling failed (msg=%s): %v", msg.ID, err)
-		}
-		return
-	}
-
-	log.Printf("processed event stream_id=%s event_id=%v type=%v source=%v retry=%d",
-		msg.ID, msg.Values["event_id"], msg.Values["event_type"], msg.Values["source"], retry)
-
-	if err := acknowledgeDeliveredMessage(ctx, msg, func(ctx context.Context, messageID string) error {
-		return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
-	}); err != nil {
-		log.Printf("XACK error: %v", err)
-	}
-}
-
-// processMessage is where delivery work happens.
-// For testing retries, if event_type == "force.fail" we fail intentionally.
-func processMessage(msg redis.XMessage) error {
-	et, _ := msg.Values["event_type"].(string)
-	if et == "force.fail" {
-		return delivery.NewRetryableFailure(errors.New("forced failure for testing"))
-	}
-
-	if et == "webhook" {
-		return processWebhookMessage(msg, &http.Client{Timeout: 10 * time.Second})
-	}
-
-	return nil
-}
-
-func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
-	payloadStr, ok := msg.Values["payload"].(string)
-	if !ok {
-		return delivery.NewPermanentFailure(errors.New("webhook event missing payload"))
-	}
-
-	var payloadData struct {
-		URL  string `json:"url"`
-		Data any    `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(payloadStr), &payloadData); err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("invalid webhook payload: %w", err))
-	}
-
-	if payloadData.URL == "" {
-		return delivery.NewPermanentFailure(errors.New("webhook url is required"))
-	}
-
-	bodyBytes, err := json.Marshal(payloadData.Data)
-	if err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("failed to marshal webhook data: %w", err))
-	}
-
-	req, err := http.NewRequest(http.MethodPost, payloadData.URL, strings.NewReader(string(bodyBytes)))
-	if err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("create webhook request: %w", err))
-	}
-	if eventID, ok := msg.Values["event_id"].(string); ok && eventID != "" {
-		req.Header.Set("Idempotency-Key", eventID)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return delivery.NewRetryableFailure(fmt.Errorf("deliver webhook request: %w", err))
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return delivery.NewHTTPFailure(resp.StatusCode, resp.Status)
-	}
-
-	log.Printf("webhook delivered successfully to %s", payloadData.URL)
-	return nil
-}
-
-type scheduleRetryFunc func(context.Context, redis.XMessage, int, time.Duration) error
-type writeDLQFunc func(context.Context, redis.XMessage, error) error
-type acknowledgeMessageFunc func(context.Context, string) error
-
-func handleDeliveryFailure(
-	ctx context.Context,
-	msg redis.XMessage,
-	cause error,
-	retry int,
-	maxRetries int,
-	baseBackoff time.Duration,
-	schedule scheduleRetryFunc,
-	writeDLQ writeDLQFunc,
-	ack acknowledgeMessageFunc,
-) error {
-	switch delivery.DecideFailureAction(cause, retry, maxRetries) {
-	case delivery.FailureActionRetry:
-		nextRetry := retry + 1
-		delay := backoffDelay(baseBackoff, nextRetry)
-		if err := schedule(ctx, msg, nextRetry, delay); err != nil {
-			return fmt.Errorf("schedule retry for message %s: %w", msg.ID, err)
-		}
-	case delivery.FailureActionDeadLetter:
-		if err := writeDLQ(ctx, msg, cause); err != nil {
-			return fmt.Errorf("write message %s to DLQ: %w", msg.ID, err)
-		}
-	default:
-		return fmt.Errorf("unknown delivery failure action for message %s", msg.ID)
-	}
-
-	if err := ack(ctx, msg.ID); err != nil {
-		return fmt.Errorf("acknowledge message %s after failure handling: %w", msg.ID, err)
-	}
-	return nil
-}
-
-func acknowledgeDeliveredMessage(ctx context.Context, msg redis.XMessage, ack acknowledgeMessageFunc) error {
-	if err := ack(ctx, msg.ID); err != nil {
-		return fmt.Errorf("acknowledge delivered message %s: %w", msg.ID, err)
-	}
-	return nil
-}
-
-func scheduleRetry(ctx context.Context, rdb *redis.Client, msg redis.XMessage, nextRetry int, delay time.Duration) error {
-	// We store the full Values as JSON in a ZSET member so we can re-publish later.
-	values := msg.Values
-	values["retry"] = strconv.Itoa(nextRetry)
-	values["original_stream_id"] = msg.ID
-
-	b, err := json.Marshal(values)
-	if err != nil {
-		return err
-	}
-
-	due := time.Now().Add(delay).UnixMilli()
-	return rdb.ZAdd(ctx, RetryZSet, redis.Z{
-		Score:  float64(due),
-		Member: string(b),
-	}).Err()
-}
-
-func retryPump(rdb *redis.Client) {
-	ctx := context.Background()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		now := time.Now().UnixMilli()
-
-		members, err := rdb.ZRangeByScore(ctx, RetryZSet, &redis.ZRangeBy{
-			Min:    "-inf",
-			Max:    strconv.FormatInt(now, 10),
-			Offset: 0,
-			Count:  50,
-		}).Result()
-		if err != nil || len(members) == 0 {
-			continue
-		}
-
-		for _, m := range members {
-			if err := republishRetryMember(
-				ctx,
-				m,
-				func(ctx context.Context, values map[string]interface{}) error {
-					_, err := rdb.XAdd(ctx, &redis.XAddArgs{
-						Stream: EventStream,
-						Values: values,
-					}).Result()
-					return err
-				},
-				func(ctx context.Context, member string) error {
-					removed, err := rdb.ZRem(ctx, RetryZSet, member).Result()
-					if err != nil {
-						return err
-					}
-					if removed == 0 {
-						return fmt.Errorf("remove retry member affected 0 rows")
-					}
-					return nil
-				},
-			); err != nil {
-				log.Printf("retry republish failed: %v", err)
-			}
-		}
-	}
-}
-
-func republishRetryMember(
-	ctx context.Context,
-	member string,
-	publish func(context.Context, map[string]interface{}) error,
-	remove func(context.Context, string) error,
-) error {
-	var values map[string]interface{}
-	if err := json.Unmarshal([]byte(member), &values); err != nil {
-		return fmt.Errorf("decode retry member: %w", err)
-	}
-
-	if err := publish(ctx, values); err != nil {
-		return fmt.Errorf("publish retry member: %w", err)
-	}
-	if err := remove(ctx, member); err != nil {
-		return fmt.Errorf("remove published retry member: %w", err)
-	}
-	return nil
-}
-
-func moveToDLQ(ctx context.Context, rdb *redis.Client, msg redis.XMessage, cause error) error {
-	values := msg.Values
-	values["dlq_at"] = time.Now().UTC().Format(time.RFC3339)
-	values["error"] = cause.Error()
-	values["original_stream_id"] = msg.ID
-
-	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: DLQStream,
-		Values: values,
-	}).Result()
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func parseRetry(v interface{}) int {
-	s, ok := v.(string)
-	if !ok {
-		return 0
-	}
-	i, err := strconv.Atoi(s)
-	if err != nil {
-		return 0
-	}
-	return i
-}
-
-func backoffDelay(base time.Duration, retry int) time.Duration {
-	// Exponential backoff: base * 2^(retry-1), capped
-	mult := 1 << (retry - 1)
-	d := time.Duration(mult) * base
-	if d > 10*time.Second {
-		return 10 * time.Second
-	}
-	return d
 }
 
 func envInt(key string, def int) int {
