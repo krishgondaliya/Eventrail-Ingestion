@@ -115,6 +115,24 @@ func TestCreateEventHandlerValidation(t *testing.T) {
 	}
 }
 
+func TestCreateEventHandlerRejectsOversizedBody(t *testing.T) {
+	persist := &recordingPersistEvent{}
+	handler := NewCreateEventHandler(persist.persist)
+
+	body := `{"event_type":"invoice.created","source":"billing","payload":"` + strings.Repeat("a", int(MaxJSONRequestBodyBytes)) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status %d, got %d", http.StatusRequestEntityTooLarge, rr.Code)
+	}
+	if persist.calls != 0 {
+		t.Fatalf("expected persist not to be called, got %d calls", persist.calls)
+	}
+}
+
 func TestCreateEventHandlerAcceptsTrailingWhitespace(t *testing.T) {
 	persist := &recordingPersistEvent{
 		result: ingestion.PersistResult{EventID: "event-new", Created: true},

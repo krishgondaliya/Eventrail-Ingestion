@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 
@@ -37,17 +36,17 @@ func NewCreateEventHandler(persist PersistEventFunc) http.HandlerFunc {
 			return
 		}
 
-		decoder := json.NewDecoder(r.Body)
-
 		var req CreateEventRequest
-		if err := decoder.Decode(&req); err != nil {
+		if err := DecodeJSONRequest(w, r, &req); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			if errors.Is(err, ErrExtraJSONValue) {
+				http.Error(w, "request body must contain exactly one JSON value", http.StatusBadRequest)
+				return
+			}
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
-			return
-		}
-
-		var extra any
-		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-			http.Error(w, "request body must contain exactly one JSON value", http.StatusBadRequest)
 			return
 		}
 

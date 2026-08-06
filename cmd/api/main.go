@@ -251,7 +251,11 @@ func main() {
 		}
 
 		var req ReplayRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := httpapi.DecodeJSONRequest(w, r, &req); err != nil {
+			if httpapi.IsRequestBodyTooLarge(err) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
 		}
@@ -350,7 +354,11 @@ func main() {
 		}
 
 		var req SetGroupCursorRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := httpapi.DecodeJSONRequest(w, r, &req); err != nil {
+			if httpapi.IsRequestBodyTooLarge(err) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
 		}
@@ -375,8 +383,13 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:    ":8080",
-		Handler: http.DefaultServeMux,
+		Addr:              ":8080",
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	serverErr := make(chan error, 1)
