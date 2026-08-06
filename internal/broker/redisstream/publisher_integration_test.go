@@ -19,12 +19,14 @@ func TestPublisherRedisIntegration(t *testing.T) {
 
 	ctx := context.Background()
 	client := redis.NewClient(&redis.Options{Addr: addr})
-	defer client.Close()
 
 	stream := newTestStreamName(t)
 	t.Cleanup(func() {
 		if err := client.Del(context.Background(), stream).Err(); err != nil {
 			t.Logf("delete Redis test stream %s: %v", stream, err)
+		}
+		if err := client.Close(); err != nil {
+			t.Logf("close Redis test client: %v", err)
 		}
 	})
 
