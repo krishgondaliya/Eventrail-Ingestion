@@ -1,4 +1,4 @@
-package main
+package outbox
 
 import (
 	"context"
@@ -141,7 +141,7 @@ func TestSanitizeOutboxErrorTruncatesLongMessage(t *testing.T) {
 
 func TestValidatePublishNextOutboxConfig(t *testing.T) {
 	pool := new(pgxpool.Pool)
-	validPublish := func() publishOutboxEventFunc {
+	validPublish := func() PublishOutboxEventFunc {
 		return func(ctx context.Context, event OutboxEvent) error {
 			return nil
 		}
@@ -150,7 +150,7 @@ func TestValidatePublishNextOutboxConfig(t *testing.T) {
 	tests := []struct {
 		name        string
 		pool        *pgxpool.Pool
-		publish     publishOutboxEventFunc
+		publish     PublishOutboxEventFunc
 		baseBackoff time.Duration
 		maxBackoff  time.Duration
 		wantErr     bool

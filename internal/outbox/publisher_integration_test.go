@@ -1,15 +1,19 @@
-package main
+package outbox
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/testutil"
 )
 
 type outboxPublisherRow struct {
@@ -49,15 +53,15 @@ func (p *recordingOutboxPublisher) event(index int) OutboxEvent {
 }
 
 func TestPublishNextOutboxEventIntegrationSuccessfulPublication(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 	req := sampleOutboxEventRequest()
 	persisted := persistSampleOutboxEvent(t, pool, req)
 
 	publisher := &recordingOutboxPublisher{}
-	result, err := publishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, 10*time.Second)
+	result, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, 10*time.Second)
 	if err != nil {
-		t.Fatalf("publishNextOutboxEvent returned error: %v", err)
+		t.Fatalf("PublishNextOutboxEvent returned error: %v", err)
 	}
 
 	if !result.Found || !result.Published {
@@ -101,12 +105,12 @@ func TestPublishNextOutboxEventIntegrationSuccessfulPublication(t *testing.T) {
 }
 
 func TestPublishNextOutboxEventIntegrationNoEligibleWork(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	publisher := &recordingOutboxPublisher{}
 
-	result, err := publishNextOutboxEvent(context.Background(), pool, publisher.publish, 100*time.Millisecond, 10*time.Second)
+	result, err := PublishNextOutboxEvent(context.Background(), pool, publisher.publish, 100*time.Millisecond, 10*time.Second)
 	if err != nil {
-		t.Fatalf("publishNextOutboxEvent returned error: %v", err)
+		t.Fatalf("PublishNextOutboxEvent returned error: %v", err)
 	}
 	if result.Found {
 		t.Fatalf("expected no work, got %#v", result)
@@ -117,7 +121,7 @@ func TestPublishNextOutboxEventIntegrationNoEligibleWork(t *testing.T) {
 }
 
 func TestPublishNextOutboxEventIntegrationFutureScheduledRowSkipped(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 	persisted := persistSampleOutboxEvent(t, pool, sampleOutboxEventRequest())
 
@@ -126,9 +130,9 @@ func TestPublishNextOutboxEventIntegrationFutureScheduledRowSkipped(t *testing.T
 	}
 
 	publisher := &recordingOutboxPublisher{}
-	result, err := publishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, 10*time.Second)
+	result, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, 10*time.Second)
 	if err != nil {
-		t.Fatalf("publishNextOutboxEvent returned error: %v", err)
+		t.Fatalf("PublishNextOutboxEvent returned error: %v", err)
 	}
 	if result.Found {
 		t.Fatalf("expected future row to be skipped, got %#v", result)
@@ -139,13 +143,13 @@ func TestPublishNextOutboxEventIntegrationFutureScheduledRowSkipped(t *testing.T
 }
 
 func TestPublishNextOutboxEventIntegrationFailedPublicationIsRescheduled(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 	persisted := persistSampleOutboxEvent(t, pool, sampleOutboxEventRequest())
 
 	publisher := &recordingOutboxPublisher{err: errors.New(" remote timeout ")}
 	firstStartedAt := time.Now()
-	first, err := publishNextOutboxEvent(ctx, pool, publisher.publish, time.Minute, time.Hour)
+	first, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, time.Minute, time.Hour)
 	if err == nil {
 		t.Fatal("expected publication failure error")
 	}
@@ -183,7 +187,7 @@ func TestPublishNextOutboxEventIntegrationFailedPublicationIsRescheduled(t *test
 	}
 
 	makeOutboxEligible(t, pool, first.OutboxID)
-	second, err := publishNextOutboxEvent(ctx, pool, publisher.publish, time.Minute, time.Hour)
+	second, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, time.Minute, time.Hour)
 	if err == nil {
 		t.Fatal("expected second publication failure error")
 	}
@@ -200,12 +204,12 @@ func TestPublishNextOutboxEventIntegrationFailedPublicationIsRescheduled(t *test
 }
 
 func TestPublishNextOutboxEventIntegrationRetryEventuallySucceeds(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 	persistSampleOutboxEvent(t, pool, sampleOutboxEventRequest())
 
 	publisher := &recordingOutboxPublisher{err: errors.New("temporary outage")}
-	first, err := publishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
+	first, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
 	if err == nil {
 		t.Fatal("expected first publication failure")
 	}
@@ -215,7 +219,7 @@ func TestPublishNextOutboxEventIntegrationRetryEventuallySucceeds(t *testing.T) 
 
 	makeOutboxEligible(t, pool, first.OutboxID)
 	publisher.err = nil
-	second, err := publishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
+	second, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
 	if err != nil {
 		t.Fatalf("expected retry success, got %v", err)
 	}
@@ -239,7 +243,7 @@ func TestPublishNextOutboxEventIntegrationRetryEventuallySucceeds(t *testing.T) 
 }
 
 func TestPublishNextOutboxEventIntegrationConcurrentPublishers(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 	persistSampleOutboxEvent(t, pool, sampleOutboxEventRequest())
 
@@ -271,7 +275,7 @@ func TestPublishNextOutboxEventIntegrationConcurrentPublishers(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			result, err := publishNextOutboxEvent(ctx, pool, publish, 100*time.Millisecond, time.Second)
+			result, err := PublishNextOutboxEvent(ctx, pool, publish, 100*time.Millisecond, time.Second)
 			results <- result
 			errs <- err
 		}()
@@ -324,7 +328,7 @@ func TestPublishNextOutboxEventIntegrationConcurrentPublishers(t *testing.T) {
 }
 
 func TestPublishNextOutboxEventIntegrationSuccessfulPublishUpdateFailureRollsBack(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 	persisted := persistSampleOutboxEvent(t, pool, sampleOutboxEventRequest())
 
@@ -351,7 +355,7 @@ func TestPublishNextOutboxEventIntegrationSuccessfulPublishUpdateFailureRollsBac
 	}
 
 	publisher := &recordingOutboxPublisher{}
-	_, err := publishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
+	_, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
 	if err == nil {
 		t.Fatal("expected database update failure after successful publish")
 	}
@@ -377,7 +381,7 @@ func TestPublishNextOutboxEventIntegrationSuccessfulPublishUpdateFailureRollsBac
 		t.Fatalf("drop rejecting update function: %v", err)
 	}
 
-	second, err := publishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
+	second, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, 100*time.Millisecond, time.Second)
 	if err != nil {
 		t.Fatalf("expected future call to publish again, got %v", err)
 	}
@@ -389,18 +393,18 @@ func TestPublishNextOutboxEventIntegrationSuccessfulPublishUpdateFailureRollsBac
 	}
 }
 
-func sampleOutboxEventRequest() CreateEventRequest {
-	return CreateEventRequest{
+func sampleOutboxEventRequest() ingestion.EventInput {
+	return ingestion.EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
 }
 
-func persistSampleOutboxEvent(t *testing.T, pool *pgxpool.Pool, req CreateEventRequest) PersistEventResult {
+func persistSampleOutboxEvent(t *testing.T, pool *pgxpool.Pool, req ingestion.EventInput) ingestion.PersistResult {
 	t.Helper()
 
-	result, err := persistEventWithOutbox(context.Background(), pool, req, "payment-INV-2048")
+	result, err := ingestion.PersistEventWithOutbox(context.Background(), pool, req, "payment-INV-2048")
 	if err != nil {
 		t.Fatalf("persist sample outbox event: %v", err)
 	}
@@ -464,4 +468,27 @@ func makeOutboxEligible(t *testing.T, pool *pgxpool.Pool, outboxID string) {
 	if _, err := pool.Exec(context.Background(), `UPDATE outbox SET next_attempt_at = now() WHERE id = $1::uuid`, outboxID); err != nil {
 		t.Fatalf("make outbox row eligible: %v", err)
 	}
+}
+
+func assertJSONEqual(t *testing.T, got string, want string) {
+	t.Helper()
+
+	gotValue := decodeJSONValue(t, []byte(got))
+	wantValue := decodeJSONValue(t, []byte(want))
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("JSON mismatch\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+func decodeJSONValue(t *testing.T, raw []byte) any {
+	t.Helper()
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		t.Fatalf("decode JSON value %q: %v", string(raw), err)
+	}
+	return value
 }

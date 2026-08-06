@@ -13,6 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -26,17 +28,6 @@ const (
 	DefaultMaxRetries  = 5
 	DefaultBaseBackoff = 500 * time.Millisecond
 )
-
-type CreateEventRequest struct {
-	EventType string          `json:"event_type"`
-	Source    string          `json:"source"`
-	Payload   json.RawMessage `json:"payload"`
-}
-
-type CreateEventResponse struct {
-	ID      string `json:"id"`
-	Created bool   `json:"created"`
-}
 
 type Event struct {
 	ID        string          `json:"id"`
@@ -129,12 +120,12 @@ func main() {
 
 	persist := func(
 		ctx context.Context,
-		req CreateEventRequest,
+		input ingestion.EventInput,
 		idempotencyKey string,
-	) (PersistEventResult, error) {
-		return persistEventWithOutbox(ctx, pgPool, req, idempotencyKey)
+	) (ingestion.PersistResult, error) {
+		return ingestion.PersistEventWithOutbox(ctx, pgPool, input, idempotencyKey)
 	}
-	http.HandleFunc("/events", newCreateEventHandler(persist))
+	http.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
 
 	// --------------------
 	// GET /events/{id}

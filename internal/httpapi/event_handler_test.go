@@ -1,4 +1,4 @@
-package main
+package httpapi
 
 import (
 	"context"
@@ -9,30 +9,32 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
 )
 
 type recordingPersistEvent struct {
-	result          PersistEventResult
+	result          ingestion.PersistResult
 	err             error
 	calls           int
 	receivedCtx     context.Context
-	receivedReq     CreateEventRequest
+	receivedInput   ingestion.EventInput
 	receivedKey     string
 	failOnExtraCall bool
 }
 
 func (p *recordingPersistEvent) persist(
 	ctx context.Context,
-	req CreateEventRequest,
+	input ingestion.EventInput,
 	idempotencyKey string,
-) (PersistEventResult, error) {
+) (ingestion.PersistResult, error) {
 	p.calls++
 	p.receivedCtx = ctx
-	p.receivedReq = req
+	p.receivedInput = input
 	p.receivedKey = idempotencyKey
 
 	if p.failOnExtraCall && p.calls > 1 {
-		return PersistEventResult{}, errors.New("persist called more than once")
+		return ingestion.PersistResult{}, errors.New("persist called more than once")
 	}
 
 	return p.result, p.err
@@ -40,7 +42,7 @@ func (p *recordingPersistEvent) persist(
 
 func TestCreateEventHandlerRejectsNonPost(t *testing.T) {
 	persist := &recordingPersistEvent{}
-	handler := newCreateEventHandler(persist.persist)
+	handler := NewCreateEventHandler(persist.persist)
 
 	req := httptest.NewRequest(http.MethodGet, "/events", nil)
 	rr := httptest.NewRecorder()
@@ -96,7 +98,7 @@ func TestCreateEventHandlerValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			persist := &recordingPersistEvent{}
-			handler := newCreateEventHandler(persist.persist)
+			handler := NewCreateEventHandler(persist.persist)
 
 			req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(tt.body))
 			rr := httptest.NewRecorder()
@@ -115,9 +117,9 @@ func TestCreateEventHandlerValidation(t *testing.T) {
 
 func TestCreateEventHandlerAcceptsTrailingWhitespace(t *testing.T) {
 	persist := &recordingPersistEvent{
-		result: PersistEventResult{EventID: "event-new", Created: true},
+		result: ingestion.PersistResult{EventID: "event-new", Created: true},
 	}
-	handler := newCreateEventHandler(persist.persist)
+	handler := NewCreateEventHandler(persist.persist)
 
 	body := "{\"event_type\":\"invoice.created\",\"source\":\"billing\",\"payload\":{}}\n\t  "
 	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))
@@ -163,9 +165,9 @@ func TestCreateEventHandlerAcceptsFalseyPayloads(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			persist := &recordingPersistEvent{
-				result: PersistEventResult{EventID: "event-new", Created: true},
+				result: ingestion.PersistResult{EventID: "event-new", Created: true},
 			}
-			handler := newCreateEventHandler(persist.persist)
+			handler := NewCreateEventHandler(persist.persist)
 
 			body := `{"event_type":"invoice.created","source":"billing","payload":` + tt.payload + `}`
 			req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))
@@ -186,21 +188,21 @@ func TestCreateEventHandlerAcceptsFalseyPayloads(t *testing.T) {
 func TestCreateEventHandlerSuccess(t *testing.T) {
 	tests := []struct {
 		name        string
-		result      PersistEventResult
+		result      ingestion.PersistResult
 		wantStatus  int
 		wantID      string
 		wantCreated bool
 	}{
 		{
 			name:        "new event",
-			result:      PersistEventResult{EventID: "event-new", Created: true},
+			result:      ingestion.PersistResult{EventID: "event-new", Created: true},
 			wantStatus:  http.StatusCreated,
 			wantID:      "event-new",
 			wantCreated: true,
 		},
 		{
 			name:        "identical retry",
-			result:      PersistEventResult{EventID: "event-existing", Created: false},
+			result:      ingestion.PersistResult{EventID: "event-existing", Created: false},
 			wantStatus:  http.StatusOK,
 			wantID:      "event-existing",
 			wantCreated: false,
@@ -213,7 +215,7 @@ func TestCreateEventHandlerSuccess(t *testing.T) {
 				result:          tt.result,
 				failOnExtraCall: true,
 			}
-			handler := newCreateEventHandler(persist.persist)
+			handler := NewCreateEventHandler(persist.persist)
 
 			body := `{"event_type":"invoice.created","source":"billing","payload":{"amount":500}}`
 			req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))
@@ -252,14 +254,14 @@ func TestCreateEventHandlerSuccess(t *testing.T) {
 			if persist.receivedKey != " key-123 " {
 				t.Fatalf("expected idempotency key to be passed through, got %q", persist.receivedKey)
 			}
-			if persist.receivedReq.EventType != "invoice.created" {
-				t.Fatalf("expected event_type invoice.created, got %q", persist.receivedReq.EventType)
+			if persist.receivedInput.EventType != "invoice.created" {
+				t.Fatalf("expected event_type invoice.created, got %q", persist.receivedInput.EventType)
 			}
-			if persist.receivedReq.Source != "billing" {
-				t.Fatalf("expected source billing, got %q", persist.receivedReq.Source)
+			if persist.receivedInput.Source != "billing" {
+				t.Fatalf("expected source billing, got %q", persist.receivedInput.Source)
 			}
-			if string(persist.receivedReq.Payload) != `{"amount":500}` {
-				t.Fatalf("expected payload to be parsed, got %s", string(persist.receivedReq.Payload))
+			if string(persist.receivedInput.Payload) != `{"amount":500}` {
+				t.Fatalf("expected payload to be parsed, got %s", string(persist.receivedInput.Payload))
 			}
 		})
 	}
@@ -268,10 +270,10 @@ func TestCreateEventHandlerSuccess(t *testing.T) {
 func TestCreateEventHandlerIdempotencyConflict(t *testing.T) {
 	wrappedConflict := fmt.Errorf(
 		"outer database detail event-internal request_hash abc123 payload secret: %w",
-		fmt.Errorf("inner: %w", ErrIdempotencyConflict),
+		fmt.Errorf("inner: %w", ingestion.ErrIdempotencyConflict),
 	)
 	persist := &recordingPersistEvent{err: wrappedConflict}
-	handler := newCreateEventHandler(persist.persist)
+	handler := NewCreateEventHandler(persist.persist)
 
 	body := `{"event_type":"invoice.created","source":"billing","payload":{"secret":"payload-value"}}`
 	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))
@@ -303,7 +305,7 @@ func TestCreateEventHandlerInternalError(t *testing.T) {
 	persist := &recordingPersistEvent{
 		err: errors.New("database exploded with request_hash abc123 and payload secret"),
 	}
-	handler := newCreateEventHandler(persist.persist)
+	handler := NewCreateEventHandler(persist.persist)
 
 	body := `{"event_type":"invoice.created","source":"billing","payload":{"secret":"payload-value"}}`
 	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))

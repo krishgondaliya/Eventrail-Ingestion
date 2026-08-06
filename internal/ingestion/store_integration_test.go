@@ -1,26 +1,20 @@
-package main
+package ingestion
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/testutil"
 )
 
 type storedEvent struct {
@@ -41,17 +35,17 @@ type storedOutbox struct {
 }
 
 func TestPersistEventWithOutboxIntegrationNewKeyedEvent(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 
-	req := CreateEventRequest{
+	req := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
-	result, err := persistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
+	result, err := PersistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
 	if err != nil {
-		t.Fatalf("persistEventWithOutbox returned error: %v", err)
+		t.Fatalf("PersistEventWithOutbox returned error: %v", err)
 	}
 	if !result.Created {
 		t.Fatal("expected Created true")
@@ -106,15 +100,15 @@ func TestPersistEventWithOutboxIntegrationNewKeyedEvent(t *testing.T) {
 }
 
 func TestPersistEventWithOutboxIntegrationIdenticalRetry(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 
-	firstReq := CreateEventRequest{
+	firstReq := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
-	secondReq := CreateEventRequest{
+	secondReq := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload: json.RawMessage(`{
@@ -124,7 +118,7 @@ func TestPersistEventWithOutboxIntegrationIdenticalRetry(t *testing.T) {
 		}`),
 	}
 
-	first, err := persistEventWithOutbox(ctx, pool, firstReq, "payment-INV-2048")
+	first, err := PersistEventWithOutbox(ctx, pool, firstReq, "payment-INV-2048")
 	if err != nil {
 		t.Fatalf("first persist returned error: %v", err)
 	}
@@ -132,7 +126,7 @@ func TestPersistEventWithOutboxIntegrationIdenticalRetry(t *testing.T) {
 		t.Fatal("expected first request to create event")
 	}
 
-	second, err := persistEventWithOutbox(ctx, pool, secondReq, "payment-INV-2048")
+	second, err := PersistEventWithOutbox(ctx, pool, secondReq, "payment-INV-2048")
 	if err != nil {
 		t.Fatalf("second persist returned error: %v", err)
 	}
@@ -154,26 +148,26 @@ func TestPersistEventWithOutboxIntegrationIdenticalRetry(t *testing.T) {
 }
 
 func TestPersistEventWithOutboxIntegrationConflictingRetry(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 
-	firstReq := CreateEventRequest{
+	firstReq := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
-	secondReq := CreateEventRequest{
+	secondReq := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":600,"currency":"USD"}`),
 	}
 
-	first, err := persistEventWithOutbox(ctx, pool, firstReq, "payment-INV-2048")
+	first, err := PersistEventWithOutbox(ctx, pool, firstReq, "payment-INV-2048")
 	if err != nil {
 		t.Fatalf("first persist returned error: %v", err)
 	}
 
-	_, err = persistEventWithOutbox(ctx, pool, secondReq, "payment-INV-2048")
+	_, err = PersistEventWithOutbox(ctx, pool, secondReq, "payment-INV-2048")
 	if err == nil {
 		t.Fatal("expected idempotency conflict error")
 	}
@@ -197,20 +191,20 @@ func TestPersistEventWithOutboxIntegrationConflictingRetry(t *testing.T) {
 }
 
 func TestPersistEventWithOutboxIntegrationNoKeyCreatesIndependentEvents(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 
-	req := CreateEventRequest{
+	req := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
 
-	first, err := persistEventWithOutbox(ctx, pool, req, "")
+	first, err := PersistEventWithOutbox(ctx, pool, req, "")
 	if err != nil {
 		t.Fatalf("first persist returned error: %v", err)
 	}
-	second, err := persistEventWithOutbox(ctx, pool, req, "   ")
+	second, err := PersistEventWithOutbox(ctx, pool, req, "   ")
 	if err != nil {
 		t.Fatalf("second persist returned error: %v", err)
 	}
@@ -233,18 +227,18 @@ func TestPersistEventWithOutboxIntegrationNoKeyCreatesIndependentEvents(t *testi
 }
 
 func TestPersistEventWithOutboxIntegrationConcurrentIdenticalRequests(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 
 	const goroutines = 10
-	req := CreateEventRequest{
+	req := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
 
 	start := make(chan struct{})
-	results := make([]PersistEventResult, goroutines)
+	results := make([]PersistResult, goroutines)
 	errs := make([]error, goroutines)
 	var wg sync.WaitGroup
 
@@ -253,7 +247,7 @@ func TestPersistEventWithOutboxIntegrationConcurrentIdenticalRequests(t *testing
 		go func(index int) {
 			defer wg.Done()
 			<-start
-			results[index], errs[index] = persistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
+			results[index], errs[index] = PersistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
 		}(i)
 	}
 
@@ -291,7 +285,7 @@ func TestPersistEventWithOutboxIntegrationConcurrentIdenticalRequests(t *testing
 }
 
 func TestPersistEventWithOutboxIntegrationLegacyNullHashConflicts(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 
 	legacyPayload := json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`)
@@ -309,12 +303,12 @@ func TestPersistEventWithOutboxIntegrationLegacyNullHashConflicts(t *testing.T) 
 		t.Fatalf("insert legacy event: %v", err)
 	}
 
-	req := CreateEventRequest{
+	req := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   legacyPayload,
 	}
-	_, err := persistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
+	_, err := PersistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
 	if err == nil {
 		t.Fatal("expected idempotency conflict")
 	}
@@ -336,19 +330,19 @@ func TestPersistEventWithOutboxIntegrationLegacyNullHashConflicts(t *testing.T) 
 }
 
 func TestPersistEventWithOutboxIntegrationOutboxFailureRollsBackEvent(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx := context.Background()
 
 	if _, err := pool.Exec(ctx, `ALTER TABLE outbox ADD CONSTRAINT outbox_reject_test CHECK (false)`); err != nil {
 		t.Fatalf("add rejecting outbox constraint: %v", err)
 	}
 
-	req := CreateEventRequest{
+	req := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
-	_, err := persistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
+	_, err := PersistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
 	if err == nil {
 		t.Fatal("expected outbox insertion failure")
 	}
@@ -362,16 +356,16 @@ func TestPersistEventWithOutboxIntegrationOutboxFailureRollsBackEvent(t *testing
 }
 
 func TestPersistEventWithOutboxIntegrationCancelledContextDoesNotPersist(t *testing.T) {
-	pool := newIntegrationTestPool(t)
+	pool := testutil.NewPostgresPool(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	req := CreateEventRequest{
+	req := EventInput{
 		EventType: "invoice.paid",
 		Source:    "payments-service",
 		Payload:   json.RawMessage(`{"invoice_id":"INV-2048","amount":500,"currency":"USD"}`),
 	}
-	_, err := persistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
+	_, err := PersistEventWithOutbox(ctx, pool, req, "payment-INV-2048")
 	if err == nil {
 		t.Fatal("expected cancelled context error")
 	}
@@ -382,162 +376,6 @@ func TestPersistEventWithOutboxIntegrationCancelledContextDoesNotPersist(t *test
 	if got := countRows(t, pool, "outbox"); got != 0 {
 		t.Fatalf("expected no outbox rows, got %d", got)
 	}
-}
-
-func TestCreateEventHandlerPostgresIntegration(t *testing.T) {
-	pool := newIntegrationTestPool(t)
-
-	handler := newCreateEventHandler(func(
-		ctx context.Context,
-		req CreateEventRequest,
-		idempotencyKey string,
-	) (PersistEventResult, error) {
-		return persistEventWithOutbox(ctx, pool, req, idempotencyKey)
-	})
-
-	first := performCreateEventRequest(t, handler, `{"event_type":"invoice.paid","source":"payments-service","payload":{"invoice_id":"INV-2048","amount":500,"currency":"USD"}}`, "payment-INV-2048")
-	if first.StatusCode != http.StatusCreated {
-		t.Fatalf("expected first request status %d, got %d", http.StatusCreated, first.StatusCode)
-	}
-	if !first.Body.Created || first.Body.ID == "" {
-		t.Fatalf("expected first response to create event, got %#v", first.Body)
-	}
-
-	second := performCreateEventRequest(t, handler, `{"source":"payments-service","event_type":"invoice.paid","payload":{"currency":"USD","amount":500,"invoice_id":"INV-2048"}}`, "payment-INV-2048")
-	if second.StatusCode != http.StatusOK {
-		t.Fatalf("expected second request status %d, got %d", http.StatusOK, second.StatusCode)
-	}
-	if second.Body.Created {
-		t.Fatalf("expected identical retry to return created=false, got %#v", second.Body)
-	}
-	if second.Body.ID != first.Body.ID {
-		t.Fatalf("expected identical retry ID %q, got %q", first.Body.ID, second.Body.ID)
-	}
-
-	conflict := performRawCreateEventRequest(t, handler, `{"event_type":"invoice.paid","source":"payments-service","payload":{"invoice_id":"INV-2048","amount":600,"currency":"USD"}}`, "payment-INV-2048")
-	if conflict.Code != http.StatusConflict {
-		t.Fatalf("expected conflict status %d, got %d with body %q", http.StatusConflict, conflict.Code, conflict.Body.String())
-	}
-
-	if got := countRows(t, pool, "events"); got != 1 {
-		t.Fatalf("expected one event row, got %d", got)
-	}
-	if got := countRows(t, pool, "outbox"); got != 1 {
-		t.Fatalf("expected one outbox row, got %d", got)
-	}
-}
-
-func newIntegrationTestPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-
-	dsn := os.Getenv("TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("TEST_POSTGRES_DSN is not set; skipping PostgreSQL integration test")
-	}
-
-	ctx := context.Background()
-	adminPool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("create admin PostgreSQL pool: %v", err)
-	}
-
-	schemaName := newSafeIntegrationSchemaName(t)
-	quotedSchemaName := quotePostgresIdentifier(schemaName)
-	if _, err := adminPool.Exec(ctx, "CREATE SCHEMA "+quotedSchemaName); err != nil {
-		adminPool.Close()
-		t.Fatalf("create test schema %s: %v", schemaName, err)
-	}
-
-	var testPool *pgxpool.Pool
-	t.Cleanup(func() {
-		if testPool != nil {
-			testPool.Close()
-		}
-		if _, err := adminPool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+quotedSchemaName+" CASCADE"); err != nil {
-			t.Logf("drop test schema %s: %v", schemaName, err)
-		}
-		adminPool.Close()
-	})
-
-	config, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse TEST_POSTGRES_DSN: %v", err)
-	}
-	config.MaxConns = 16
-	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		_, err := conn.Exec(ctx, "SET search_path TO "+quotedSchemaName+", public")
-		return err
-	}
-
-	testPool, err = pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		t.Fatalf("create test PostgreSQL pool: %v", err)
-	}
-
-	applyMigrations(t, ctx, testPool)
-	return testPool
-}
-
-func applyMigrations(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
-	t.Helper()
-
-	migrationsDir := findMigrationsDir(t)
-	files, err := filepath.Glob(filepath.Join(migrationsDir, "*.sql"))
-	if err != nil {
-		t.Fatalf("list migrations: %v", err)
-	}
-	sort.Strings(files)
-	if len(files) == 0 {
-		t.Fatalf("no migration files found in %s", migrationsDir)
-	}
-
-	for _, file := range files {
-		sqlBytes, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatalf("read migration %s: %v", filepath.Base(file), err)
-		}
-		if _, err := pool.Exec(ctx, string(sqlBytes)); err != nil {
-			t.Fatalf("apply migration %s: %v", filepath.Base(file), err)
-		}
-	}
-}
-
-func findMigrationsDir(t *testing.T) string {
-	t.Helper()
-
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("get working directory: %v", err)
-	}
-
-	for {
-		goMod := filepath.Join(dir, "go.mod")
-		migrationsDir := filepath.Join(dir, "migrations")
-		if fileExists(goMod) && dirExists(migrationsDir) {
-			return migrationsDir
-		}
-
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Fatal("could not find repository root containing go.mod and migrations")
-		}
-		dir = parent
-	}
-}
-
-func newSafeIntegrationSchemaName(t *testing.T) string {
-	t.Helper()
-
-	var randomBytes [8]byte
-	if _, err := rand.Read(randomBytes[:]); err != nil {
-		t.Fatalf("generate schema suffix: %v", err)
-	}
-	return fmt.Sprintf("eventrail_test_%d_%x", time.Now().UnixNano(), randomBytes[:])
-}
-
-func quotePostgresIdentifier(identifier string) string {
-	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 func countRows(t *testing.T, pool *pgxpool.Pool, table string) int {
@@ -554,6 +392,10 @@ func countWhere(t *testing.T, pool *pgxpool.Pool, table string, where string) in
 		t.Fatalf("count rows in %s: %v", table, err)
 	}
 	return count
+}
+
+func quotePostgresIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 func fetchStoredEvent(t *testing.T, pool *pgxpool.Pool, eventID string) storedEvent {
@@ -622,43 +464,4 @@ func decodeJSONValue(t *testing.T, raw []byte) any {
 		t.Fatalf("decode JSON value %q: %v", string(raw), err)
 	}
 	return value
-}
-
-type createEventHTTPResult struct {
-	StatusCode int
-	Body       CreateEventResponse
-}
-
-func performCreateEventRequest(t *testing.T, handler http.Handler, body string, idempotencyKey string) createEventHTTPResult {
-	t.Helper()
-
-	rr := performRawCreateEventRequest(t, handler, body, idempotencyKey)
-	var response CreateEventResponse
-	if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
-		t.Fatalf("decode create event response body %q: %v", rr.Body.String(), err)
-	}
-	return createEventHTTPResult{
-		StatusCode: rr.Code,
-		Body:       response,
-	}
-}
-
-func performRawCreateEventRequest(t *testing.T, handler http.Handler, body string, idempotencyKey string) *httptest.ResponseRecorder {
-	t.Helper()
-
-	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))
-	req.Header.Set("Idempotency-Key", idempotencyKey)
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
-	return rr
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
-}
-
-func dirExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
 }

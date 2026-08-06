@@ -1,4 +1,4 @@
-package main
+package httpapi
 
 import (
 	"bytes"
@@ -8,15 +8,28 @@ import (
 	"io"
 	"log"
 	"net/http"
+
+	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
 )
 
-type persistEventFunc func(
-	ctx context.Context,
-	req CreateEventRequest,
-	idempotencyKey string,
-) (PersistEventResult, error)
+type CreateEventRequest struct {
+	EventType string          `json:"event_type"`
+	Source    string          `json:"source"`
+	Payload   json.RawMessage `json:"payload"`
+}
 
-func newCreateEventHandler(persist persistEventFunc) http.HandlerFunc {
+type CreateEventResponse struct {
+	ID      string `json:"id"`
+	Created bool   `json:"created"`
+}
+
+type PersistEventFunc func(
+	ctx context.Context,
+	input ingestion.EventInput,
+	idempotencyKey string,
+) (ingestion.PersistResult, error)
+
+func NewCreateEventHandler(persist PersistEventFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -43,9 +56,13 @@ func newCreateEventHandler(persist persistEventFunc) http.HandlerFunc {
 			return
 		}
 
-		result, err := persist(r.Context(), req, r.Header.Get("Idempotency-Key"))
+		result, err := persist(r.Context(), ingestion.EventInput{
+			EventType: req.EventType,
+			Source:    req.Source,
+			Payload:   req.Payload,
+		}, r.Header.Get("Idempotency-Key"))
 		if err != nil {
-			if errors.Is(err, ErrIdempotencyConflict) {
+			if errors.Is(err, ingestion.ErrIdempotencyConflict) {
 				http.Error(w, "idempotency key was already used for a different request", http.StatusConflict)
 				return
 			}

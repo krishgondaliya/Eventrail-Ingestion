@@ -1,4 +1,4 @@
-package main
+package outbox
 
 import (
 	"context"
@@ -26,7 +26,7 @@ type OutboxEvent struct {
 	AttemptCount int
 }
 
-type publishOutboxEventFunc func(
+type PublishOutboxEventFunc func(
 	ctx context.Context,
 	event OutboxEvent,
 ) error
@@ -73,10 +73,10 @@ const rescheduleOutboxAfterFailureSQL = `
 		published_at = NULL
 	WHERE id = $1::uuid`
 
-func publishNextOutboxEvent(
+func PublishNextOutboxEvent(
 	ctx context.Context,
 	pool *pgxpool.Pool,
-	publish publishOutboxEventFunc,
+	publish PublishOutboxEventFunc,
 	baseBackoff time.Duration,
 	maxBackoff time.Duration,
 ) (PublishNextOutboxResult, error) {
@@ -134,7 +134,7 @@ func publishNextOutboxEvent(
 
 func validatePublishNextOutboxConfig(
 	pool *pgxpool.Pool,
-	publish publishOutboxEventFunc,
+	publish PublishOutboxEventFunc,
 	baseBackoff time.Duration,
 	maxBackoff time.Duration,
 ) error {

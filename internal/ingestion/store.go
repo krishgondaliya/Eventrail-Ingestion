@@ -1,7 +1,8 @@
-package main
+package ingestion
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +13,13 @@ import (
 
 var ErrIdempotencyConflict = errors.New("idempotency key conflict")
 
-type PersistEventResult struct {
+type EventInput struct {
+	EventType string
+	Source    string
+	Payload   json.RawMessage
+}
+
+type PersistResult struct {
 	EventID string
 	Created bool
 }
@@ -51,22 +58,22 @@ const insertOutboxSQL = `
 	INSERT INTO outbox (event_id)
 	VALUES ($1)`
 
-func persistEventWithOutbox(
+func PersistEventWithOutbox(
 	ctx context.Context,
 	pool *pgxpool.Pool,
-	req CreateEventRequest,
+	req EventInput,
 	idempotencyKey string,
-) (PersistEventResult, error) {
+) (PersistResult, error) {
 	normalizedKey := strings.TrimSpace(idempotencyKey)
 
 	requestHash, err := computeRequestHash(req.EventType, req.Source, req.Payload)
 	if err != nil {
-		return PersistEventResult{}, fmt.Errorf("compute request hash: %w", err)
+		return PersistResult{}, fmt.Errorf("compute request hash: %w", err)
 	}
 
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return PersistEventResult{}, fmt.Errorf("begin persist event transaction: %w", err)
+		return PersistResult{}, fmt.Errorf("begin persist event transaction: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback(ctx)
@@ -75,11 +82,11 @@ func persistEventWithOutbox(
 	if normalizedKey == "" {
 		result, err := insertEventWithoutKeyWithOutbox(ctx, tx, req, requestHash)
 		if err != nil {
-			return PersistEventResult{}, err
+			return PersistResult{}, err
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return PersistEventResult{}, fmt.Errorf("commit new event without idempotency key: %w", err)
+			return PersistResult{}, fmt.Errorf("commit new event without idempotency key: %w", err)
 		}
 		return result, nil
 	}
@@ -97,36 +104,36 @@ func persistEventWithOutbox(
 
 	if err == nil {
 		if err := insertOutboxForEvent(ctx, tx, eventID); err != nil {
-			return PersistEventResult{}, err
+			return PersistResult{}, err
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return PersistEventResult{}, fmt.Errorf("commit new event with idempotency key: %w", err)
+			return PersistResult{}, fmt.Errorf("commit new event with idempotency key: %w", err)
 		}
-		return PersistEventResult{EventID: eventID, Created: true}, nil
+		return PersistResult{EventID: eventID, Created: true}, nil
 	}
 
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return PersistEventResult{}, fmt.Errorf("insert event with idempotency key: %w", err)
+		return PersistResult{}, fmt.Errorf("insert event with idempotency key: %w", err)
 	}
 
 	eventID, err = existingEventIDForMatchingRequestHash(ctx, tx, req.Source, normalizedKey, requestHash)
 	if err != nil {
-		return PersistEventResult{}, err
+		return PersistResult{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return PersistEventResult{}, fmt.Errorf("commit existing idempotent event lookup: %w", err)
+		return PersistResult{}, fmt.Errorf("commit existing idempotent event lookup: %w", err)
 	}
-	return PersistEventResult{EventID: eventID, Created: false}, nil
+	return PersistResult{EventID: eventID, Created: false}, nil
 }
 
 func insertEventWithoutKeyWithOutbox(
 	ctx context.Context,
 	tx pgx.Tx,
-	req CreateEventRequest,
+	req EventInput,
 	requestHash string,
-) (PersistEventResult, error) {
+) (PersistResult, error) {
 	var eventID string
 
 	if err := tx.QueryRow(
@@ -137,14 +144,14 @@ func insertEventWithoutKeyWithOutbox(
 		req.Payload,
 		requestHash,
 	).Scan(&eventID); err != nil {
-		return PersistEventResult{}, fmt.Errorf("insert event without idempotency key: %w", err)
+		return PersistResult{}, fmt.Errorf("insert event without idempotency key: %w", err)
 	}
 
 	if err := insertOutboxForEvent(ctx, tx, eventID); err != nil {
-		return PersistEventResult{}, err
+		return PersistResult{}, err
 	}
 
-	return PersistEventResult{EventID: eventID, Created: true}, nil
+	return PersistResult{EventID: eventID, Created: true}, nil
 }
 
 func existingEventIDForMatchingRequestHash(
