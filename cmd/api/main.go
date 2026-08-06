@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/broker/redisstream"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/delivery"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/outbox"
@@ -382,6 +384,7 @@ func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseB
 
 				if err := processMessage(msg); err != nil {
 					// failure path
+					// Phase 3B will use delivery.IsPermanent to bypass retries safely.
 					nextRetry := retry + 1
 					if nextRetry > maxRetries {
 						moveToDLQ(ctx, rdb, msg, err)
@@ -418,51 +421,56 @@ func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseB
 func processMessage(msg redis.XMessage) error {
 	et, _ := msg.Values["event_type"].(string)
 	if et == "force.fail" {
-		return errors.New("forced failure for testing")
+		return delivery.NewRetryableFailure(errors.New("forced failure for testing"))
 	}
 
 	if et == "webhook" {
-		payloadStr, ok := msg.Values["payload"].(string)
-		if !ok {
-			return errors.New("webhook event missing payload")
-		}
-
-		var payloadData struct {
-			URL  string `json:"url"`
-			Data any    `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(payloadStr), &payloadData); err != nil {
-			return errors.New("invalid webhook payload: " + err.Error())
-		}
-
-		if payloadData.URL == "" {
-			return errors.New("webhook url is required")
-		}
-
-		bodyBytes, err := json.Marshal(payloadData.Data)
-		if err != nil {
-			return errors.New("failed to marshal webhook data: " + err.Error())
-		}
-
-		req, err := http.NewRequest(http.MethodPost, payloadData.URL, strings.NewReader(string(bodyBytes)))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode >= 400 {
-			return errors.New("webhook failed with status: " + resp.Status)
-		}
-		log.Printf("webhook delivered successfully to %s", payloadData.URL)
+		return processWebhookMessage(msg, &http.Client{Timeout: 10 * time.Second})
 	}
 
+	return nil
+}
+
+func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
+	payloadStr, ok := msg.Values["payload"].(string)
+	if !ok {
+		return delivery.NewPermanentFailure(errors.New("webhook event missing payload"))
+	}
+
+	var payloadData struct {
+		URL  string `json:"url"`
+		Data any    `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(payloadStr), &payloadData); err != nil {
+		return delivery.NewPermanentFailure(fmt.Errorf("invalid webhook payload: %w", err))
+	}
+
+	if payloadData.URL == "" {
+		return delivery.NewPermanentFailure(errors.New("webhook url is required"))
+	}
+
+	bodyBytes, err := json.Marshal(payloadData.Data)
+	if err != nil {
+		return delivery.NewPermanentFailure(fmt.Errorf("failed to marshal webhook data: %w", err))
+	}
+
+	req, err := http.NewRequest(http.MethodPost, payloadData.URL, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return delivery.NewPermanentFailure(fmt.Errorf("create webhook request: %w", err))
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return delivery.NewRetryableFailure(fmt.Errorf("deliver webhook request: %w", err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return delivery.NewHTTPFailure(resp.StatusCode, resp.Status)
+	}
+
+	log.Printf("webhook delivered successfully to %s", payloadData.URL)
 	return nil
 }
 
