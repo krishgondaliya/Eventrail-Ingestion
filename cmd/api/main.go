@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -61,7 +65,15 @@ type SetGroupCursorRequest struct {
 }
 
 func main() {
-	ctx := context.Background()
+	signalCtx, stopSignals := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stopSignals()
+
+	ctx, cancelApp := context.WithCancel(context.Background())
+	defer cancelApp()
 
 	pgDSN := os.Getenv("POSTGRES_DSN")
 	redisAddr := os.Getenv("REDIS_ADDR")
@@ -125,7 +137,10 @@ func main() {
 		log.Fatalf("create outbox runner: %v", err)
 	}
 
+	var workers sync.WaitGroup
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		log.Println("outbox publisher started")
 		if err := outboxRunner.Run(ctx); err != nil {
 			log.Printf("outbox publisher stopped with error: %v", err)
@@ -133,7 +148,13 @@ func main() {
 	}()
 
 	// Worker reads stream, reclaims pending messages, processes delivery, retries, and DLQs.
-	go deliveryWorker.Run(context.Background())
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		if err := deliveryWorker.Run(ctx); err != nil {
+			log.Printf("delivery worker stopped with error: %v", err)
+		}
+	}()
 
 	// --------------------
 	// Health Check
@@ -348,8 +369,37 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	log.Println("EventRail API starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: http.DefaultServeMux,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Println("EventRail API starting on :8080")
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case <-signalCtx.Done():
+		log.Println("shutdown signal received")
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown failed: %v", err)
+		}
+		cancelShutdown()
+		cancelApp()
+		workers.Wait()
+	case err := <-serverErr:
+		if err != nil {
+			log.Printf("HTTP server stopped with error: %v", err)
+		}
+		cancelApp()
+		workers.Wait()
+	}
 }
 
 func envInt(key string, def int) int {

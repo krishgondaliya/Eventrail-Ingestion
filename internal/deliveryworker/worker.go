@@ -50,15 +50,28 @@ func (w *Worker) EnsureConsumerGroup(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) Run(ctx context.Context) {
-	go w.retryPump(ctx)
-	w.runStreamWorker(ctx)
+func (w *Worker) Run(ctx context.Context) error {
+	retryDone := make(chan error, 1)
+	go func() {
+		retryDone <- w.retryPump(ctx)
+	}()
+
+	workerErr := w.runStreamWorker(ctx)
+	retryErr := <-retryDone
+	if workerErr != nil {
+		return workerErr
+	}
+	return retryErr
 }
 
-func (w *Worker) runStreamWorker(ctx context.Context) {
+func (w *Worker) runStreamWorker(ctx context.Context) error {
 	log.Printf("stream worker started (group=%s consumer=%s)", w.config.ConsumerGroup, w.config.Consumer)
 
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
 		reclaimed, err := reclaimPendingMessagesForConsumer(
 			ctx,
 			w.client,
@@ -69,9 +82,15 @@ func (w *Worker) runStreamWorker(ctx context.Context) {
 			PendingClaimCount,
 		)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			log.Printf("XAUTOCLAIM error: %v", err)
 		}
 		for _, msg := range reclaimed {
+			if ctx.Err() != nil {
+				return nil
+			}
 			w.processStreamMessage(ctx, msg)
 		}
 
@@ -84,16 +103,24 @@ func (w *Worker) runStreamWorker(ctx context.Context) {
 		}).Result()
 
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			if err == redis.Nil {
 				continue
 			}
 			log.Printf("XREADGROUP error: %v", err)
-			time.Sleep(500 * time.Millisecond)
+			if !waitForContext(ctx, 500*time.Millisecond) {
+				return nil
+			}
 			continue
 		}
 
 		for _, stream := range res {
 			for _, msg := range stream.Messages {
+				if ctx.Err() != nil {
+					return nil
+				}
 				w.processStreamMessage(ctx, msg)
 			}
 		}
@@ -306,11 +333,17 @@ func scheduleRetry(
 	}).Err()
 }
 
-func (w *Worker) retryPump(ctx context.Context) {
+func (w *Worker) retryPump(ctx context.Context) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+
 		now := time.Now().UnixMilli()
 
 		members, err := w.client.ZRangeByScore(ctx, w.config.RetryZSet, &redis.ZRangeBy{
@@ -320,10 +353,16 @@ func (w *Worker) retryPump(ctx context.Context) {
 			Count:  50,
 		}).Result()
 		if err != nil || len(members) == 0 {
+			if ctx.Err() != nil {
+				return nil
+			}
 			continue
 		}
 
 		for _, m := range members {
+			if ctx.Err() != nil {
+				return nil
+			}
 			if err := republishRetryMember(
 				ctx,
 				m,
@@ -407,4 +446,16 @@ func backoffDelay(base time.Duration, retry int) time.Duration {
 		return 10 * time.Second
 	}
 	return d
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
