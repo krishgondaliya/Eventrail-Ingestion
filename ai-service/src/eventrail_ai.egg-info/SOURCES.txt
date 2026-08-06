@@ -1,9 +1,0 @@
-pyproject.toml
-src/eventrail_ai/__init__.py
-src/eventrail_ai/runbooks.py
-src/eventrail_ai.egg-info/PKG-INFO
-src/eventrail_ai.egg-info/SOURCES.txt
-src/eventrail_ai.egg-info/dependency_links.txt
-src/eventrail_ai.egg-info/requires.txt
-src/eventrail_ai.egg-info/top_level.txt
-tests/test_runbooks.py
