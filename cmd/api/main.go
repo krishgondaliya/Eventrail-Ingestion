@@ -40,6 +40,12 @@ const (
 	DefaultOutboxMaxBackoff   = 30 * time.Second
 )
 
+var (
+	version = "dev"
+	commit  = "unknown"
+	builtAt = "unknown"
+)
+
 type Event struct {
 	ID        string          `json:"id"`
 	EventType string          `json:"event_type"`
@@ -161,34 +167,18 @@ func main() {
 		}
 	}()
 
-	// --------------------
-	// Health Check
-	// --------------------
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		hctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-
-		pgStatus := "ok"
-		if err := pgPool.Ping(hctx); err != nil {
-			pgStatus = "error"
-		}
-
-		redisStatus := "ok"
-		if err := redisClient.Ping(hctx).Err(); err != nil {
-			redisStatus = "error"
-		}
-
-		status := "ok"
-		if pgStatus != "ok" || redisStatus != "ok" {
-			status = "degraded"
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(
-			`{"status":"` + status + `","postgres":"` + pgStatus + `","redis":"` + redisStatus + `"}`,
-		))
-	})
+	readinessHandler := httpapi.NewReadinessHandler(
+		func(ctx context.Context) error {
+			return pgPool.Ping(ctx)
+		},
+		func(ctx context.Context) error {
+			return redisClient.Ping(ctx).Err()
+		},
+	)
+	http.Handle("/health/live", httpapi.NewLivenessHandler())
+	http.Handle("/health/ready", readinessHandler)
+	http.Handle("/health", readinessHandler)
+	http.Handle("/version", httpapi.NewVersionHandler("eventrail-api", version, commit, builtAt))
 
 	persist := func(
 		ctx context.Context,
