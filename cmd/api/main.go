@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/broker/redisstream"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/config"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/deliveryworker"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
@@ -31,13 +32,8 @@ const (
 	DLQStream     = "eventrail.events.dlq"
 	RetryZSet     = "eventrail.events.retry" // delayed retry scheduler (ZSET)
 
-	DefaultWorker      = "api-1"
-	DefaultMaxRetries  = 5
-	DefaultBaseBackoff = 500 * time.Millisecond
-
-	DefaultOutboxPollInterval = 250 * time.Millisecond
-	DefaultOutboxBaseBackoff  = 500 * time.Millisecond
-	DefaultOutboxMaxBackoff   = 30 * time.Second
+	DefaultOutboxBaseBackoff = 500 * time.Millisecond
+	DefaultOutboxMaxBackoff  = 30 * time.Second
 )
 
 var (
@@ -82,19 +78,12 @@ func main() {
 	ctx, cancelApp := context.WithCancel(context.Background())
 	defer cancelApp()
 
-	pgDSN := os.Getenv("POSTGRES_DSN")
-	redisAddr := os.Getenv("REDIS_ADDR")
-
-	consumer := strings.TrimSpace(os.Getenv("CONSUMER_NAME"))
-	if consumer == "" {
-		consumer = DefaultWorker
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("invalid configuration: %v", err)
 	}
 
-	maxRetries := envInt("MAX_RETRIES", DefaultMaxRetries)
-	baseBackoff := envDuration("BASE_BACKOFF_MS", DefaultBaseBackoff)
-	outboxPollInterval := envDuration("OUTBOX_POLL_INTERVAL_MS", DefaultOutboxPollInterval)
-
-	pgPool, err := pgxpool.New(ctx, pgDSN)
+	pgPool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
 		log.Fatalf("failed to connect to postgres: %v", err)
 	}
@@ -105,18 +94,18 @@ func main() {
 	}
 
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
+		Addr: cfg.RedisAddr,
 	})
 	defer redisClient.Close()
 
 	deliveryWorker := deliveryworker.New(redisClient, deliveryworker.Config{
 		Stream:        EventStream,
 		ConsumerGroup: ConsumerGroup,
-		Consumer:      consumer,
+		Consumer:      cfg.ConsumerName,
 		DLQStream:     DLQStream,
 		RetryZSet:     RetryZSet,
-		MaxRetries:    maxRetries,
-		BaseBackoff:   baseBackoff,
+		MaxRetries:    cfg.MaxRetries,
+		BaseBackoff:   cfg.BaseBackoff,
 	})
 	if err := deliveryWorker.EnsureConsumerGroup(ctx); err != nil {
 		log.Fatalf("failed to ensure consumer group: %v", err)
@@ -139,7 +128,7 @@ func main() {
 
 	outboxRunner, err := outbox.NewRunner(
 		publishNext,
-		outboxPollInterval,
+		cfg.OutboxPollInterval,
 		func(err error) {
 			log.Printf("outbox publisher error: %v", err)
 		},
@@ -408,29 +397,4 @@ func main() {
 		cancelApp()
 		workers.Wait()
 	}
-}
-
-func envInt(key string, def int) int {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return def
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil {
-		return def
-	}
-	return v
-}
-
-// BASE_BACKOFF_MS is an int in milliseconds
-func envDuration(key string, def time.Duration) time.Duration {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return def
-	}
-	ms, err := strconv.Atoi(raw)
-	if err != nil {
-		return def
-	}
-	return time.Duration(ms) * time.Millisecond
 }
