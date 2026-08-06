@@ -35,6 +35,9 @@ const (
 	DefaultOutboxPollInterval = 250 * time.Millisecond
 	DefaultOutboxBaseBackoff  = 500 * time.Millisecond
 	DefaultOutboxMaxBackoff   = 30 * time.Second
+
+	PendingClaimIdle  = 30 * time.Second
+	PendingClaimCount = 10
 )
 
 type Event struct {
@@ -361,6 +364,22 @@ func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseB
 	log.Printf("stream worker started (group=%s consumer=%s)", ConsumerGroup, consumer)
 
 	for {
+		reclaimed, err := reclaimPendingMessagesForConsumer(
+			ctx,
+			rdb,
+			EventStream,
+			ConsumerGroup,
+			consumer,
+			PendingClaimIdle,
+			PendingClaimCount,
+		)
+		if err != nil {
+			log.Printf("XAUTOCLAIM error: %v", err)
+		}
+		for _, msg := range reclaimed {
+			processStreamMessage(ctx, rdb, msg, maxRetries, baseBackoff)
+		}
+
 		res, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    ConsumerGroup,
 			Consumer: consumer,
@@ -380,42 +399,84 @@ func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseB
 
 		for _, stream := range res {
 			for _, msg := range stream.Messages {
-				retry := parseRetry(msg.Values["retry"])
-
-				if err := processMessage(msg); err != nil {
-					if err := handleDeliveryFailure(
-						ctx,
-						msg,
-						err,
-						retry,
-						maxRetries,
-						baseBackoff,
-						func(ctx context.Context, msg redis.XMessage, nextRetry int, delay time.Duration) error {
-							return scheduleRetry(ctx, rdb, msg, nextRetry, delay)
-						},
-						func(ctx context.Context, msg redis.XMessage, cause error) error {
-							return moveToDLQ(ctx, rdb, msg, cause)
-						},
-						func(ctx context.Context, messageID string) error {
-							return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
-						},
-					); err != nil {
-						log.Printf("delivery failure handling failed (msg=%s): %v", msg.ID, err)
-					}
-					continue
-				}
-
-				// success
-				log.Printf("processed event stream_id=%s event_id=%v type=%v source=%v retry=%d",
-					msg.ID, msg.Values["event_id"], msg.Values["event_type"], msg.Values["source"], retry)
-
-				if err := acknowledgeDeliveredMessage(ctx, msg, func(ctx context.Context, messageID string) error {
-					return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
-				}); err != nil {
-					log.Printf("XACK error: %v", err)
-				}
+				processStreamMessage(ctx, rdb, msg, maxRetries, baseBackoff)
 			}
 		}
+	}
+}
+
+func reclaimPendingMessages(
+	ctx context.Context,
+	client *redis.Client,
+	consumer string,
+) ([]redis.XMessage, error) {
+	return reclaimPendingMessagesForConsumer(
+		ctx,
+		client,
+		EventStream,
+		ConsumerGroup,
+		consumer,
+		PendingClaimIdle,
+		PendingClaimCount,
+	)
+}
+
+func reclaimPendingMessagesForConsumer(
+	ctx context.Context,
+	client *redis.Client,
+	stream string,
+	group string,
+	consumer string,
+	minIdle time.Duration,
+	count int64,
+) ([]redis.XMessage, error) {
+	messages, _, err := client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   stream,
+		Group:    group,
+		Consumer: consumer,
+		MinIdle:  minIdle,
+		Start:    "0-0",
+		Count:    count,
+	}).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	return messages, err
+}
+
+func processStreamMessage(ctx context.Context, rdb *redis.Client, msg redis.XMessage, maxRetries int, baseBackoff time.Duration) {
+	retry := parseRetry(msg.Values["retry"])
+
+	if err := processMessage(msg); err != nil {
+		if err := handleDeliveryFailure(
+			ctx,
+			msg,
+			err,
+			retry,
+			maxRetries,
+			baseBackoff,
+			func(ctx context.Context, msg redis.XMessage, nextRetry int, delay time.Duration) error {
+				return scheduleRetry(ctx, rdb, msg, nextRetry, delay)
+			},
+			func(ctx context.Context, msg redis.XMessage, cause error) error {
+				return moveToDLQ(ctx, rdb, msg, cause)
+			},
+			func(ctx context.Context, messageID string) error {
+				return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
+			},
+		); err != nil {
+			log.Printf("delivery failure handling failed (msg=%s): %v", msg.ID, err)
+		}
+		return
+	}
+
+	log.Printf("processed event stream_id=%s event_id=%v type=%v source=%v retry=%d",
+		msg.ID, msg.Values["event_id"], msg.Values["event_type"], msg.Values["source"], retry)
+
+	if err := acknowledgeDeliveredMessage(ctx, msg, func(ctx context.Context, messageID string) error {
+		return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
+	}); err != nil {
+		log.Printf("XACK error: %v", err)
 	}
 }
 
