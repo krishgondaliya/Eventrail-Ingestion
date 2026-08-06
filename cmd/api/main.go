@@ -383,24 +383,25 @@ func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseB
 				retry := parseRetry(msg.Values["retry"])
 
 				if err := processMessage(msg); err != nil {
-					// failure path
-					// Phase 3B will use delivery.IsPermanent to bypass retries safely.
-					nextRetry := retry + 1
-					if nextRetry > maxRetries {
-						moveToDLQ(ctx, rdb, msg, err)
-						_ = rdb.XAck(ctx, EventStream, ConsumerGroup, msg.ID).Err()
-						continue
+					if err := handleDeliveryFailure(
+						ctx,
+						msg,
+						err,
+						retry,
+						maxRetries,
+						baseBackoff,
+						func(ctx context.Context, msg redis.XMessage, nextRetry int, delay time.Duration) error {
+							return scheduleRetry(ctx, rdb, msg, nextRetry, delay)
+						},
+						func(ctx context.Context, msg redis.XMessage, cause error) error {
+							return moveToDLQ(ctx, rdb, msg, cause)
+						},
+						func(ctx context.Context, messageID string) error {
+							return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
+						},
+					); err != nil {
+						log.Printf("delivery failure handling failed (msg=%s): %v", msg.ID, err)
 					}
-
-					delay := backoffDelay(baseBackoff, nextRetry)
-					if err := scheduleRetry(ctx, rdb, msg, nextRetry, delay); err != nil {
-						// If scheduling fails, keep it unacked so it stays pending.
-						log.Printf("schedule retry failed (msg=%s): %v", msg.ID, err)
-						continue
-					}
-
-					// Once scheduled, ack original so it doesn't sit in pending forever
-					_ = rdb.XAck(ctx, EventStream, ConsumerGroup, msg.ID).Err()
 					continue
 				}
 
@@ -408,7 +409,9 @@ func startStreamWorker(rdb *redis.Client, consumer string, maxRetries int, baseB
 				log.Printf("processed event stream_id=%s event_id=%v type=%v source=%v retry=%d",
 					msg.ID, msg.Values["event_id"], msg.Values["event_type"], msg.Values["source"], retry)
 
-				if err := rdb.XAck(ctx, EventStream, ConsumerGroup, msg.ID).Err(); err != nil {
+				if err := acknowledgeDeliveredMessage(ctx, msg, func(ctx context.Context, messageID string) error {
+					return rdb.XAck(ctx, EventStream, ConsumerGroup, messageID).Err()
+				}); err != nil {
 					log.Printf("XACK error: %v", err)
 				}
 			}
@@ -471,6 +474,49 @@ func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
 	}
 
 	log.Printf("webhook delivered successfully to %s", payloadData.URL)
+	return nil
+}
+
+type scheduleRetryFunc func(context.Context, redis.XMessage, int, time.Duration) error
+type writeDLQFunc func(context.Context, redis.XMessage, error) error
+type acknowledgeMessageFunc func(context.Context, string) error
+
+func handleDeliveryFailure(
+	ctx context.Context,
+	msg redis.XMessage,
+	cause error,
+	retry int,
+	maxRetries int,
+	baseBackoff time.Duration,
+	schedule scheduleRetryFunc,
+	writeDLQ writeDLQFunc,
+	ack acknowledgeMessageFunc,
+) error {
+	switch delivery.DecideFailureAction(cause, retry, maxRetries) {
+	case delivery.FailureActionRetry:
+		nextRetry := retry + 1
+		delay := backoffDelay(baseBackoff, nextRetry)
+		if err := schedule(ctx, msg, nextRetry, delay); err != nil {
+			return fmt.Errorf("schedule retry for message %s: %w", msg.ID, err)
+		}
+	case delivery.FailureActionDeadLetter:
+		if err := writeDLQ(ctx, msg, cause); err != nil {
+			return fmt.Errorf("write message %s to DLQ: %w", msg.ID, err)
+		}
+	default:
+		return fmt.Errorf("unknown delivery failure action for message %s", msg.ID)
+	}
+
+	if err := ack(ctx, msg.ID); err != nil {
+		return fmt.Errorf("acknowledge message %s after failure handling: %w", msg.ID, err)
+	}
+	return nil
+}
+
+func acknowledgeDeliveredMessage(ctx context.Context, msg redis.XMessage, ack acknowledgeMessageFunc) error {
+	if err := ack(ctx, msg.ID); err != nil {
+		return fmt.Errorf("acknowledge delivered message %s: %w", msg.ID, err)
+	}
 	return nil
 }
 
@@ -537,7 +583,7 @@ func retryPump(rdb *redis.Client) {
 	}
 }
 
-func moveToDLQ(ctx context.Context, rdb *redis.Client, msg redis.XMessage, cause error) {
+func moveToDLQ(ctx context.Context, rdb *redis.Client, msg redis.XMessage, cause error) error {
 	values := msg.Values
 	values["dlq_at"] = time.Now().UTC().Format(time.RFC3339)
 	values["error"] = cause.Error()
@@ -548,8 +594,9 @@ func moveToDLQ(ctx context.Context, rdb *redis.Client, msg redis.XMessage, cause
 		Values: values,
 	}).Result()
 	if err != nil {
-		log.Printf("failed to write to DLQ: %v", err)
+		return err
 	}
+	return nil
 }
 
 func parseRetry(v interface{}) int {
