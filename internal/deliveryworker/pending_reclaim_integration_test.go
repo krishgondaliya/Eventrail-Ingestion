@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -95,7 +96,12 @@ func TestReclaimPendingMessagesRedisIntegration(t *testing.T) {
 		t.Fatalf("expected pending owner %s, got %s", consumerB, pending[0].Consumer)
 	}
 
-	if err := acknowledgeDeliveredMessage(ctx, reclaimed[0], func(ctx context.Context, messageID string) error {
+	if err := acknowledgeDeliveredMessage(ctx, reclaimed[0], operations.DeliveryAttemptRecord{
+		EventID:       "00000000-0000-0000-0000-000000000001",
+		AttemptNumber: 1,
+	}, func(ctx context.Context, record operations.DeliveryAttemptRecord) error {
+		return nil
+	}, func(ctx context.Context, messageID string) error {
 		return client.XAck(ctx, stream, group, messageID).Err()
 	}); err != nil {
 		t.Fatalf("acknowledge reclaimed message: %v", err)

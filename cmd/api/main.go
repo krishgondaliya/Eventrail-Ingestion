@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +20,7 @@ import (
 	"github.com/krishgondaliya/eventrail-ingestion/internal/deliveryworker"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/outbox"
 	"github.com/krishgondaliya/eventrail-ingestion/migrations"
 	"github.com/redis/go-redis/v9"
@@ -51,16 +51,35 @@ type Event struct {
 }
 
 type ReplayRequest struct {
-	From      string `json:"from"`       // RFC3339
-	To        string `json:"to"`         // RFC3339
-	Source    string `json:"source"`     // optional
-	EventType string `json:"event_type"` // optional
-	Limit     int    `json:"limit"`      // optional, default 1000
+	From      string        `json:"from"`       // RFC3339
+	To        string        `json:"to"`         // RFC3339
+	Source    string        `json:"source"`     // optional
+	EventType string        `json:"event_type"` // optional
+	Limit     int           `json:"limit"`      // optional, default 1000
+	Cursor    *ReplayCursor `json:"cursor"`     // optional
 }
 
 type ReplayResponse struct {
-	Published int `json:"published"`
+	Published  int           `json:"published"`
+	HasMore    bool          `json:"has_more"`
+	NextCursor *ReplayCursor `json:"next_cursor,omitempty"`
 }
+
+type ReplayCursor struct {
+	CreatedAt string `json:"created_at"`
+	EventID   string `json:"event_id"`
+}
+
+type replayRows interface {
+	Close()
+	Err() error
+	Next() bool
+	Scan(dest ...any) error
+}
+
+type replayQueryFunc func(ctx context.Context, query string, args ...any) (replayRows, error)
+
+type replayPublishFunc func(ctx context.Context, values map[string]interface{}) (string, error)
 
 type SetGroupCursorRequest struct {
 	Group   string `json:"group"`    // optional, default ConsumerGroup
@@ -92,6 +111,7 @@ func main() {
 	if err := migrations.Apply(ctx, pgPool); err != nil {
 		log.Fatalf("failed to apply PostgreSQL migrations: %v", err)
 	}
+	operationsStore := operations.NewStore(pgPool)
 
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
@@ -106,6 +126,7 @@ func main() {
 		RetryZSet:     RetryZSet,
 		MaxRetries:    cfg.MaxRetries,
 		BaseBackoff:   cfg.BaseBackoff,
+		Recorder:      operationsStore,
 	})
 	if err := deliveryWorker.EnsureConsumerGroup(ctx); err != nil {
 		log.Fatalf("failed to ensure consumer group: %v", err)
@@ -168,6 +189,19 @@ func main() {
 	http.Handle("/health/ready", readinessHandler)
 	http.Handle("/health", readinessHandler)
 	http.Handle("/version", httpapi.NewVersionHandler("eventrail-api", version, commit, builtAt))
+	http.Handle("/dlq", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
+		return redisClient.XAdd(ctx, &redis.XAddArgs{
+			Stream: EventStream,
+			Values: values,
+		}).Result()
+	}))
+	http.Handle("/dlq/", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
+		return redisClient.XAdd(ctx, &redis.XAddArgs{
+			Stream: EventStream,
+			Values: values,
+		}).Result()
+	}))
+	http.Handle("/metrics/summary", httpapi.NewMetricsSummaryHandler(operationsStore))
 
 	persist := func(
 		ctx context.Context,
@@ -177,12 +211,19 @@ func main() {
 		return ingestion.PersistEventWithOutbox(ctx, pgPool, input, idempotencyKey)
 	}
 	http.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
+	eventStatusHandler := httpapi.NewEventStatusHandler(operationsStore)
 
 	// --------------------
 	// GET /events/{id}
 	// --------------------
 	http.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") {
+			eventStatusHandler.ServeHTTP(w, r)
+			return
+		}
+
 		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -195,7 +236,7 @@ func main() {
 
 		var evt Event
 		err := pgPool.QueryRow(
-			context.Background(),
+			r.Context(),
 			`SELECT id, event_type, source, payload, created_at
 			 FROM events WHERE id = $1`,
 			id,
@@ -220,107 +261,17 @@ func main() {
 		json.NewEncoder(w).Encode(evt)
 	})
 
-	// --------------------
-	// POST /replay (backfill by time range from Postgres into Redis Stream)
-	// --------------------
-	http.HandleFunc("/replay", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req ReplayRequest
-		if err := httpapi.DecodeJSONRequest(w, r, &req); err != nil {
-			if httpapi.IsRequestBodyTooLarge(err) {
-				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
-			return
-		}
-
-		if req.From == "" || req.To == "" {
-			http.Error(w, "from and to are required (RFC3339)", http.StatusBadRequest)
-			return
-		}
-
-		fromT, err := time.Parse(time.RFC3339, req.From)
-		if err != nil {
-			http.Error(w, "from must be RFC3339", http.StatusBadRequest)
-			return
-		}
-		toT, err := time.Parse(time.RFC3339, req.To)
-		if err != nil {
-			http.Error(w, "to must be RFC3339", http.StatusBadRequest)
-			return
-		}
-
-		limit := req.Limit
-		if limit <= 0 || limit > 5000 {
-			limit = 1000
-		}
-
-		query := `
-			SELECT id, event_type, source, payload, created_at
-			FROM events
-			WHERE created_at >= $1 AND created_at <= $2`
-		args := []interface{}{fromT, toT}
-
-		if req.Source != "" {
-			query += " AND source = $3"
-			args = append(args, req.Source)
-		}
-
-		if req.EventType != "" {
-			if req.Source != "" {
-				query += " AND event_type = $4"
-			} else {
-				query += " AND event_type = $3"
-			}
-			args = append(args, req.EventType)
-		}
-
-		query += " ORDER BY created_at ASC LIMIT " + strconv.Itoa(limit)
-
-		rows, err := pgPool.Query(context.Background(), query, args...)
-		if err != nil {
-			http.Error(w, "failed to query events", http.StatusInternalServerError)
-			return
-		}
-		defer rows.Close()
-
-		published := 0
-		for rows.Next() {
-			var id, eventType, source string
-			var payload []byte
-			var createdAt time.Time
-			if err := rows.Scan(&id, &eventType, &source, &payload, &createdAt); err != nil {
-				http.Error(w, "failed to read events", http.StatusInternalServerError)
-				return
-			}
-
-			_, err := redisClient.XAdd(context.Background(), &redis.XAddArgs{
+	http.HandleFunc("/replay", newReplayHandler(
+		func(ctx context.Context, query string, args ...any) (replayRows, error) {
+			return pgPool.Query(ctx, query, args...)
+		},
+		func(ctx context.Context, values map[string]interface{}) (string, error) {
+			return redisClient.XAdd(ctx, &redis.XAddArgs{
 				Stream: EventStream,
-				Values: map[string]interface{}{
-					"event_id":   id,
-					"event_type": eventType,
-					"source":     source,
-					"payload":    string(payload),
-					"retry":      "0",
-					"created_at": createdAt.UTC().Format(time.RFC3339),
-					"replay":     "1",
-				},
+				Values: values,
 			}).Result()
-			if err != nil {
-				log.Printf("replay publish failed for %s: %v", id, err)
-				continue
-			}
-			published++
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ReplayResponse{Published: published})
-	})
+		},
+	))
 
 	// --------------------
 	// POST /consumer-groups/set-cursor (consumer replay)
@@ -353,7 +304,7 @@ func main() {
 			return
 		}
 
-		if err := redisClient.XGroupSetID(context.Background(), EventStream, group, startID).Err(); err != nil {
+		if err := redisClient.XGroupSetID(r.Context(), EventStream, group, startID).Err(); err != nil {
 			http.Error(w, "failed to set group cursor", http.StatusInternalServerError)
 			return
 		}

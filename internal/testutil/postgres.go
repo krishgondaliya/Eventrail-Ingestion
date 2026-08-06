@@ -28,6 +28,7 @@ func NewPostgresPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("create admin PostgreSQL pool: %v", err)
 	}
+	ensureUUIDExtension(t, ctx, adminPool)
 
 	schemaName := newSafeIntegrationSchemaName(t)
 	quotedSchemaName := quotePostgresIdentifier(schemaName)
@@ -65,6 +66,27 @@ func NewPostgresPool(t *testing.T) *pgxpool.Pool {
 
 	applyMigrations(t, ctx, testPool)
 	return testPool
+}
+
+func ensureUUIDExtension(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+
+	const lockID int64 = 0x6576656e7472616c
+	if _, err := pool.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
+		t.Fatalf("lock uuid extension setup: %v", err)
+	}
+	defer func() {
+		if _, err := pool.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockID); err != nil {
+			t.Logf("unlock uuid extension setup: %v", err)
+		}
+	}()
+
+	if _, err := pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public`); err != nil {
+		t.Fatalf("create uuid-ossp extension: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER EXTENSION "uuid-ossp" SET SCHEMA public`); err != nil {
+		t.Fatalf("move uuid-ossp extension to public schema: %v", err)
+	}
 }
 
 func applyMigrations(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {

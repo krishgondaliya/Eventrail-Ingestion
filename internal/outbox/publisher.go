@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 )
 
 const maxStoredOutboxErrorLength = 1000
@@ -122,6 +123,9 @@ func PublishNextOutboxEvent(
 	}
 
 	if err := markOutboxPublished(ctx, tx, event.OutboxID); err != nil {
+		return PublishNextOutboxResult{}, err
+	}
+	if err := operations.InsertStatusHistory(ctx, tx, event.EventID, operations.StatusPublished, nil); err != nil {
 		return PublishNextOutboxResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

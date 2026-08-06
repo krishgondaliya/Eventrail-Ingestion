@@ -1,0 +1,67 @@
+[
+  {
+    "runbook_id": "receipt-validation-v1",
+    "title": "Receipt Validation Failures",
+    "version": "1",
+    "file": "receipt-validation.md",
+    "categories": [
+      "destination_validation_error",
+      "missing_required_field",
+      "receipt_validation"
+    ]
+  },
+  {
+    "runbook_id": "authentication-v1",
+    "title": "Authentication and Authorization Failures",
+    "version": "1",
+    "file": "authentication.md",
+    "categories": [
+      "authentication_error",
+      "authorization_error"
+    ]
+  },
+  {
+    "runbook_id": "rate-limiting-v1",
+    "title": "Rate Limiting",
+    "version": "1",
+    "file": "rate-limiting.md",
+    "categories": [
+      "rate_limited",
+      "throttling"
+    ]
+  },
+  {
+    "runbook_id": "destination-outage-v1",
+    "title": "Destination Outage",
+    "version": "1",
+    "file": "destination-outage.md",
+    "categories": [
+      "destination_outage",
+      "timeout",
+      "connection_failure",
+      "destination_5xx"
+    ]
+  },
+  {
+    "runbook_id": "schema-errors-v1",
+    "title": "Schema Errors",
+    "version": "1",
+    "file": "schema-errors.md",
+    "categories": [
+      "malformed_json",
+      "unsupported_schema_version",
+      "invalid_field_type"
+    ]
+  },
+  {
+    "runbook_id": "routing-configuration-v1",
+    "title": "Routing Configuration Failures",
+    "version": "1",
+    "file": "routing-configuration.md",
+    "categories": [
+      "routing_configuration_error",
+      "not_found",
+      "destination_url_error"
+    ]
+  }
+]

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/krishgondaliya/eventrail-ingestion/internal/delivery"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -17,6 +18,7 @@ type deliveryFailureRecorder struct {
 	delay       time.Duration
 	scheduleErr error
 	dlqErr      error
+	recordErr   error
 	ackErr      error
 }
 
@@ -37,6 +39,21 @@ func (r *deliveryFailureRecorder) ack(ctx context.Context, messageID string) err
 	return r.ackErr
 }
 
+func (r *deliveryFailureRecorder) recordRetrying(ctx context.Context, record operations.RetryingRecord) error {
+	r.steps = append(r.steps, "record_retrying")
+	return r.recordErr
+}
+
+func (r *deliveryFailureRecorder) recordDeadLettered(ctx context.Context, record operations.DeadLetterRecord) error {
+	r.steps = append(r.steps, "record_dead_lettered")
+	return r.recordErr
+}
+
+func (r *deliveryFailureRecorder) recordDelivered(ctx context.Context, record operations.DeliveryAttemptRecord) error {
+	r.steps = append(r.steps, "record_delivered")
+	return r.recordErr
+}
+
 func TestDeliveryFailurePermanentGoesDirectlyToDLQ(t *testing.T) {
 	recorder := &deliveryFailureRecorder{}
 	err := handleDeliveryFailure(
@@ -44,17 +61,22 @@ func TestDeliveryFailurePermanentGoesDirectlyToDLQ(t *testing.T) {
 		deliveryFailureMessage(),
 		delivery.NewPermanentFailure(errors.New("bad payload")),
 		0,
+		1,
+		time.Now(),
+		time.Now(),
 		5,
 		100*time.Millisecond,
 		recorder.schedule,
 		recorder.writeDLQ,
 		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
 	)
 
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
-	assertDeliveryFailureSteps(t, recorder.steps, []string{"dlq", "ack"})
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"dlq", "record_dead_lettered", "ack"})
 }
 
 func TestDeliveryFailureRetryableBelowLimitSchedulesRetry(t *testing.T) {
@@ -64,17 +86,22 @@ func TestDeliveryFailureRetryableBelowLimitSchedulesRetry(t *testing.T) {
 		deliveryFailureMessage(),
 		delivery.NewRetryableFailure(errors.New("timeout")),
 		1,
+		2,
+		time.Now(),
+		time.Now(),
 		3,
 		100*time.Millisecond,
 		recorder.schedule,
 		recorder.writeDLQ,
 		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
 	)
 
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
-	assertDeliveryFailureSteps(t, recorder.steps, []string{"retry", "ack"})
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"retry", "record_retrying", "ack"})
 	if recorder.nextRetry != 2 {
 		t.Fatalf("expected next retry 2, got %d", recorder.nextRetry)
 	}
@@ -90,17 +117,22 @@ func TestDeliveryFailureRetryableAtLimitGoesToDLQ(t *testing.T) {
 		deliveryFailureMessage(),
 		delivery.NewRetryableFailure(errors.New("timeout")),
 		3,
+		4,
+		time.Now(),
+		time.Now(),
 		3,
 		100*time.Millisecond,
 		recorder.schedule,
 		recorder.writeDLQ,
 		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
 	)
 
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
-	assertDeliveryFailureSteps(t, recorder.steps, []string{"dlq", "ack"})
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"dlq", "record_dead_lettered", "ack"})
 }
 
 func TestDeliveryFailureRetryWriteFailurePreventsAcknowledgement(t *testing.T) {
@@ -111,10 +143,15 @@ func TestDeliveryFailureRetryWriteFailurePreventsAcknowledgement(t *testing.T) {
 		delivery.NewRetryableFailure(errors.New("timeout")),
 		0,
 		1,
+		time.Now(),
+		time.Now(),
+		1,
 		100*time.Millisecond,
 		recorder.schedule,
 		recorder.writeDLQ,
 		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
 	)
 
 	if err == nil {
@@ -130,17 +167,47 @@ func TestDeliveryFailureDLQWriteFailurePreventsAcknowledgement(t *testing.T) {
 		deliveryFailureMessage(),
 		delivery.NewPermanentFailure(errors.New("bad payload")),
 		0,
+		1,
+		time.Now(),
+		time.Now(),
 		5,
 		100*time.Millisecond,
 		recorder.schedule,
 		recorder.writeDLQ,
 		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
 	)
 
 	if err == nil {
 		t.Fatal("expected DLQ write error")
 	}
 	assertDeliveryFailureSteps(t, recorder.steps, []string{"dlq"})
+}
+
+func TestDeliveryFailureOperationalRecordFailurePreventsAcknowledgement(t *testing.T) {
+	recorder := &deliveryFailureRecorder{recordErr: errors.New("postgres unavailable")}
+	err := handleDeliveryFailure(
+		context.Background(),
+		deliveryFailureMessage(),
+		delivery.NewRetryableFailure(errors.New("timeout")),
+		0,
+		1,
+		time.Now(),
+		time.Now(),
+		1,
+		100*time.Millisecond,
+		recorder.schedule,
+		recorder.writeDLQ,
+		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
+	)
+
+	if err == nil {
+		t.Fatal("expected operational record error")
+	}
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"retry", "record_retrying"})
 }
 
 func TestDeliveryFailureAcknowledgementErrorIsSurfacedAfterRetryWrite(t *testing.T) {
@@ -151,16 +218,21 @@ func TestDeliveryFailureAcknowledgementErrorIsSurfacedAfterRetryWrite(t *testing
 		errors.New("unknown failure"),
 		0,
 		1,
+		time.Now(),
+		time.Now(),
+		1,
 		100*time.Millisecond,
 		recorder.schedule,
 		recorder.writeDLQ,
 		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
 	)
 
 	if err == nil {
 		t.Fatal("expected acknowledgement error")
 	}
-	assertDeliveryFailureSteps(t, recorder.steps, []string{"retry", "ack"})
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"retry", "record_retrying", "ack"})
 }
 
 func TestDeliveryFailureAcknowledgementErrorIsSurfacedAfterDLQWrite(t *testing.T) {
@@ -170,27 +242,54 @@ func TestDeliveryFailureAcknowledgementErrorIsSurfacedAfterDLQWrite(t *testing.T
 		deliveryFailureMessage(),
 		delivery.NewPermanentFailure(errors.New("bad payload")),
 		0,
+		1,
+		time.Now(),
+		time.Now(),
 		5,
 		100*time.Millisecond,
 		recorder.schedule,
 		recorder.writeDLQ,
+		recorder.ack,
+		recorder.recordRetrying,
+		recorder.recordDeadLettered,
+	)
+
+	if err == nil {
+		t.Fatal("expected acknowledgement error")
+	}
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"dlq", "record_dead_lettered", "ack"})
+}
+
+func TestAcknowledgementErrorIsSurfacedAfterSuccessfulDelivery(t *testing.T) {
+	recorder := &deliveryFailureRecorder{ackErr: errors.New("xack failed")}
+	err := acknowledgeDeliveredMessage(
+		context.Background(),
+		deliveryFailureMessage(),
+		operations.DeliveryAttemptRecord{EventID: "event-1", AttemptNumber: 1},
+		recorder.recordDelivered,
 		recorder.ack,
 	)
 
 	if err == nil {
 		t.Fatal("expected acknowledgement error")
 	}
-	assertDeliveryFailureSteps(t, recorder.steps, []string{"dlq", "ack"})
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"record_delivered", "ack"})
 }
 
-func TestAcknowledgementErrorIsSurfacedAfterSuccessfulDelivery(t *testing.T) {
-	recorder := &deliveryFailureRecorder{ackErr: errors.New("xack failed")}
-	err := acknowledgeDeliveredMessage(context.Background(), deliveryFailureMessage(), recorder.ack)
+func TestDeliveredOperationalRecordFailurePreventsAcknowledgement(t *testing.T) {
+	recorder := &deliveryFailureRecorder{recordErr: errors.New("postgres unavailable")}
+	err := acknowledgeDeliveredMessage(
+		context.Background(),
+		deliveryFailureMessage(),
+		operations.DeliveryAttemptRecord{EventID: "event-1", AttemptNumber: 1},
+		recorder.recordDelivered,
+		recorder.ack,
+	)
 
 	if err == nil {
-		t.Fatal("expected acknowledgement error")
+		t.Fatal("expected operational record error")
 	}
-	assertDeliveryFailureSteps(t, recorder.steps, []string{"ack"})
+	assertDeliveryFailureSteps(t, recorder.steps, []string{"record_delivered"})
 }
 
 func deliveryFailureMessage() redis.XMessage {
@@ -198,6 +297,7 @@ func deliveryFailureMessage() redis.XMessage {
 		ID: "1-0",
 		Values: map[string]interface{}{
 			"event_type": "webhook",
+			"event_id":   "event-1",
 			"retry":      "0",
 		},
 	}

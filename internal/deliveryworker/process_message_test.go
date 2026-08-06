@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/krishgondaliya/eventrail-ingestion/internal/delivery"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -116,6 +117,21 @@ func TestProcessWebhookHTTPSuccess(t *testing.T) {
 	}
 }
 
+func TestProcessWebhookResultCapturesSuccessStatusCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	result, err := processMessageWithResult(webhookMessage(webhookPayload(server.URL)))
+	if err != nil {
+		t.Fatalf("expected webhook success, got %v", err)
+	}
+	if result.ResponseCode == nil || *result.ResponseCode != http.StatusAccepted {
+		t.Fatalf("expected response code %d, got %#v", http.StatusAccepted, result.ResponseCode)
+	}
+}
+
 func TestProcessWebhookSetsIdempotencyKeyFromEventID(t *testing.T) {
 	var gotIdempotencyKey string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +148,28 @@ func TestProcessWebhookSetsIdempotencyKeyFromEventID(t *testing.T) {
 	}
 	if gotIdempotencyKey != "event-123" {
 		t.Fatalf("expected Idempotency-Key event-123, got %q", gotIdempotencyKey)
+	}
+}
+
+func TestProcessingRecordFailurePreventsDestinationCall(t *testing.T) {
+	destinationCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		destinationCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	worker := New(nil, Config{
+		Recorder: failingProcessingRecorder{},
+	})
+	msg := webhookMessage(webhookPayload(server.URL))
+	msg.ID = "1-0"
+	msg.Values["event_id"] = "event-123"
+
+	worker.processStreamMessage(context.Background(), msg)
+
+	if destinationCalls != 0 {
+		t.Fatalf("expected destination not to be called, got %d calls", destinationCalls)
 	}
 }
 
@@ -170,6 +208,24 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type failingProcessingRecorder struct{}
+
+func (failingProcessingRecorder) RecordProcessing(context.Context, operations.ProcessingRecord) error {
+	return errors.New("postgres unavailable")
+}
+
+func (failingProcessingRecorder) RecordDelivered(context.Context, operations.DeliveryAttemptRecord) error {
+	return nil
+}
+
+func (failingProcessingRecorder) RecordRetrying(context.Context, operations.RetryingRecord) error {
+	return nil
+}
+
+func (failingProcessingRecorder) RecordDeadLettered(context.Context, operations.DeadLetterRecord) error {
+	return nil
 }
 
 func TestProcessWebhookRequestContextStillConstructs(t *testing.T) {

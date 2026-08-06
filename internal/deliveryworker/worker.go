@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/krishgondaliya/eventrail-ingestion/internal/delivery"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -28,18 +29,51 @@ type Config struct {
 	RetryZSet     string
 	MaxRetries    int
 	BaseBackoff   time.Duration
+	Recorder      Recorder
 }
 
 type Worker struct {
-	client *redis.Client
-	config Config
+	client   *redis.Client
+	config   Config
+	recorder Recorder
 }
 
 func New(client *redis.Client, config Config) *Worker {
-	return &Worker{
-		client: client,
-		config: config,
+	recorder := config.Recorder
+	if recorder == nil {
+		recorder = noopRecorder{}
 	}
+
+	return &Worker{
+		client:   client,
+		config:   config,
+		recorder: recorder,
+	}
+}
+
+type Recorder interface {
+	RecordProcessing(context.Context, operations.ProcessingRecord) error
+	RecordDelivered(context.Context, operations.DeliveryAttemptRecord) error
+	RecordRetrying(context.Context, operations.RetryingRecord) error
+	RecordDeadLettered(context.Context, operations.DeadLetterRecord) error
+}
+
+type noopRecorder struct{}
+
+func (noopRecorder) RecordProcessing(context.Context, operations.ProcessingRecord) error {
+	return nil
+}
+
+func (noopRecorder) RecordDelivered(context.Context, operations.DeliveryAttemptRecord) error {
+	return nil
+}
+
+func (noopRecorder) RecordRetrying(context.Context, operations.RetryingRecord) error {
+	return nil
+}
+
+func (noopRecorder) RecordDeadLettered(context.Context, operations.DeadLetterRecord) error {
+	return nil
 }
 
 func (w *Worker) EnsureConsumerGroup(ctx context.Context) error {
@@ -170,13 +204,29 @@ func reclaimPendingMessagesForConsumer(
 
 func (w *Worker) processStreamMessage(ctx context.Context, msg redis.XMessage) {
 	retry := parseRetry(msg.Values["retry"])
+	attemptNumber := retry + 1
+	startedAt := time.Now().UTC()
 
-	if err := processMessage(msg); err != nil {
+	if err := w.recorder.RecordProcessing(ctx, operations.ProcessingRecord{
+		EventID:  eventIDFromMessage(msg),
+		StreamID: msg.ID,
+		Retry:    retry,
+	}); err != nil {
+		log.Printf("record processing failed (msg=%s): %v", msg.ID, err)
+		return
+	}
+
+	result, err := processMessageWithResult(msg)
+	completedAt := time.Now().UTC()
+	if err != nil {
 		if err := handleDeliveryFailure(
 			ctx,
 			msg,
 			err,
 			retry,
+			attemptNumber,
+			startedAt,
+			completedAt,
 			w.config.MaxRetries,
 			w.config.BaseBackoff,
 			func(ctx context.Context, msg redis.XMessage, nextRetry int, delay time.Duration) error {
@@ -188,6 +238,12 @@ func (w *Worker) processStreamMessage(ctx context.Context, msg redis.XMessage) {
 			func(ctx context.Context, messageID string) error {
 				return w.client.XAck(ctx, w.config.Stream, w.config.ConsumerGroup, messageID).Err()
 			},
+			func(ctx context.Context, record operations.RetryingRecord) error {
+				return w.recorder.RecordRetrying(ctx, record)
+			},
+			func(ctx context.Context, record operations.DeadLetterRecord) error {
+				return w.recorder.RecordDeadLettered(ctx, record)
+			},
 		); err != nil {
 			log.Printf("delivery failure handling failed (msg=%s): %v", msg.ID, err)
 		}
@@ -197,32 +253,61 @@ func (w *Worker) processStreamMessage(ctx context.Context, msg redis.XMessage) {
 	log.Printf("processed event stream_id=%s event_id=%v type=%v source=%v retry=%d",
 		msg.ID, msg.Values["event_id"], msg.Values["event_type"], msg.Values["source"], retry)
 
-	if err := acknowledgeDeliveredMessage(ctx, msg, func(ctx context.Context, messageID string) error {
-		return w.client.XAck(ctx, w.config.Stream, w.config.ConsumerGroup, messageID).Err()
-	}); err != nil {
+	if err := acknowledgeDeliveredMessage(
+		ctx,
+		msg,
+		operations.DeliveryAttemptRecord{
+			EventID:       eventIDFromMessage(msg),
+			StreamID:      msg.ID,
+			AttemptNumber: attemptNumber,
+			ResponseCode:  result.ResponseCode,
+			StartedAt:     startedAt,
+			CompletedAt:   completedAt,
+		},
+		func(ctx context.Context, record operations.DeliveryAttemptRecord) error {
+			return w.recorder.RecordDelivered(ctx, record)
+		},
+		func(ctx context.Context, messageID string) error {
+			return w.client.XAck(ctx, w.config.Stream, w.config.ConsumerGroup, messageID).Err()
+		},
+	); err != nil {
 		log.Printf("XACK error: %v", err)
 	}
+}
+
+type processMessageResult struct {
+	ResponseCode *int
 }
 
 // processMessage is where delivery work happens.
 // For testing retries, if event_type == "force.fail" we fail intentionally.
 func processMessage(msg redis.XMessage) error {
+	_, err := processMessageWithResult(msg)
+	return err
+}
+
+func processMessageWithResult(msg redis.XMessage) (processMessageResult, error) {
 	et, _ := msg.Values["event_type"].(string)
 	if et == "force.fail" {
-		return delivery.NewRetryableFailure(errors.New("forced failure for testing"))
+		return processMessageResult{}, delivery.NewRetryableFailure(errors.New("forced failure for testing"))
 	}
 
 	if et == "webhook" {
-		return processWebhookMessage(msg, &http.Client{Timeout: 10 * time.Second})
+		return processWebhookMessageWithResult(msg, &http.Client{Timeout: 10 * time.Second})
 	}
 
-	return nil
+	return processMessageResult{}, nil
 }
 
 func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
+	_, err := processWebhookMessageWithResult(msg, client)
+	return err
+}
+
+func processWebhookMessageWithResult(msg redis.XMessage, client *http.Client) (processMessageResult, error) {
 	payloadStr, ok := msg.Values["payload"].(string)
 	if !ok {
-		return delivery.NewPermanentFailure(errors.New("webhook event missing payload"))
+		return processMessageResult{}, delivery.NewPermanentFailure(errors.New("webhook event missing payload"))
 	}
 
 	var payloadData struct {
@@ -230,21 +315,21 @@ func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
 		Data any    `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(payloadStr), &payloadData); err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("invalid webhook payload: %w", err))
+		return processMessageResult{}, delivery.NewPermanentFailure(fmt.Errorf("invalid webhook payload: %w", err))
 	}
 
 	if payloadData.URL == "" {
-		return delivery.NewPermanentFailure(errors.New("webhook url is required"))
+		return processMessageResult{}, delivery.NewPermanentFailure(errors.New("webhook url is required"))
 	}
 
 	bodyBytes, err := json.Marshal(payloadData.Data)
 	if err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("failed to marshal webhook data: %w", err))
+		return processMessageResult{}, delivery.NewPermanentFailure(fmt.Errorf("failed to marshal webhook data: %w", err))
 	}
 
 	req, err := http.NewRequest(http.MethodPost, payloadData.URL, strings.NewReader(string(bodyBytes)))
 	if err != nil {
-		return delivery.NewPermanentFailure(fmt.Errorf("create webhook request: %w", err))
+		return processMessageResult{}, delivery.NewPermanentFailure(fmt.Errorf("create webhook request: %w", err))
 	}
 	if eventID, ok := msg.Values["event_id"].(string); ok && eventID != "" {
 		req.Header.Set("Idempotency-Key", eventID)
@@ -253,43 +338,76 @@ func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return delivery.NewRetryableFailure(fmt.Errorf("deliver webhook request: %w", err))
+		return processMessageResult{}, delivery.NewRetryableFailure(fmt.Errorf("deliver webhook request: %w", err))
 	}
 	defer resp.Body.Close()
 
+	result := processMessageResult{ResponseCode: intPtr(resp.StatusCode)}
 	if resp.StatusCode >= 400 {
-		return delivery.NewHTTPFailure(resp.StatusCode, resp.Status)
+		return result, delivery.NewHTTPFailure(resp.StatusCode, resp.Status)
 	}
 
 	log.Printf("webhook delivered successfully to %s", payloadData.URL)
-	return nil
+	return result, nil
 }
 
 type scheduleRetryFunc func(context.Context, redis.XMessage, int, time.Duration) error
 type writeDLQFunc func(context.Context, redis.XMessage, error) error
 type acknowledgeMessageFunc func(context.Context, string) error
+type recordRetryingFunc func(context.Context, operations.RetryingRecord) error
+type recordDeadLetteredFunc func(context.Context, operations.DeadLetterRecord) error
+type recordDeliveredFunc func(context.Context, operations.DeliveryAttemptRecord) error
 
 func handleDeliveryFailure(
 	ctx context.Context,
 	msg redis.XMessage,
 	cause error,
 	retry int,
+	attemptNumber int,
+	startedAt time.Time,
+	completedAt time.Time,
 	maxRetries int,
 	baseBackoff time.Duration,
 	schedule scheduleRetryFunc,
 	writeDLQ writeDLQFunc,
 	ack acknowledgeMessageFunc,
+	recordRetrying recordRetryingFunc,
+	recordDeadLettered recordDeadLetteredFunc,
 ) error {
+	attempt := operations.DeliveryAttemptRecord{
+		EventID:       eventIDFromMessage(msg),
+		StreamID:      msg.ID,
+		AttemptNumber: attemptNumber,
+		ResponseCode:  responseCodeFromError(cause),
+		Error:         cause,
+		StartedAt:     startedAt,
+		CompletedAt:   completedAt,
+	}
+
 	switch delivery.DecideFailureAction(cause, retry, maxRetries) {
 	case delivery.FailureActionRetry:
 		nextRetry := retry + 1
 		delay := backoffDelay(baseBackoff, nextRetry)
+		scheduledAt := time.Now().UTC().Add(delay)
 		if err := schedule(ctx, msg, nextRetry, delay); err != nil {
 			return fmt.Errorf("schedule retry for message %s: %w", msg.ID, err)
+		}
+		if err := recordRetrying(ctx, operations.RetryingRecord{
+			DeliveryAttemptRecord: attempt,
+			NextRetry:             nextRetry,
+			ScheduledAt:           scheduledAt,
+		}); err != nil {
+			return fmt.Errorf("record retrying message %s: %w", msg.ID, err)
 		}
 	case delivery.FailureActionDeadLetter:
 		if err := writeDLQ(ctx, msg, cause); err != nil {
 			return fmt.Errorf("write message %s to DLQ: %w", msg.ID, err)
+		}
+		if err := recordDeadLettered(ctx, operations.DeadLetterRecord{
+			DeliveryAttemptRecord: attempt,
+			OriginalStreamID:      originalStreamIDFromMessage(msg),
+		}); err != nil {
+			return fmt.Errorf("record dead-lettered message %s: %w", msg.ID, err)
 		}
 	default:
 		return fmt.Errorf("unknown delivery failure action for message %s", msg.ID)
@@ -301,11 +419,46 @@ func handleDeliveryFailure(
 	return nil
 }
 
-func acknowledgeDeliveredMessage(ctx context.Context, msg redis.XMessage, ack acknowledgeMessageFunc) error {
+func acknowledgeDeliveredMessage(
+	ctx context.Context,
+	msg redis.XMessage,
+	record operations.DeliveryAttemptRecord,
+	recordDelivered recordDeliveredFunc,
+	ack acknowledgeMessageFunc,
+) error {
+	if err := recordDelivered(ctx, record); err != nil {
+		return fmt.Errorf("record delivered message %s: %w", msg.ID, err)
+	}
 	if err := ack(ctx, msg.ID); err != nil {
 		return fmt.Errorf("acknowledge delivered message %s: %w", msg.ID, err)
 	}
 	return nil
+}
+
+func eventIDFromMessage(msg redis.XMessage) string {
+	eventID, _ := msg.Values["event_id"].(string)
+	return strings.TrimSpace(eventID)
+}
+
+func originalStreamIDFromMessage(msg redis.XMessage) string {
+	streamID, _ := msg.Values["original_stream_id"].(string)
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		return msg.ID
+	}
+	return streamID
+}
+
+func responseCodeFromError(err error) *int {
+	var failure *delivery.Failure
+	if errors.As(err, &failure) && failure.StatusCode != 0 {
+		return intPtr(failure.StatusCode)
+	}
+	return nil
+}
+
+func intPtr(v int) *int {
+	return &v
 }
 
 func scheduleRetry(

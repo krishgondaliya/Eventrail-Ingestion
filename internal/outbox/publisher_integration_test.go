@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/testutil"
 )
 
@@ -102,6 +103,7 @@ func TestPublishNextOutboxEventIntegrationSuccessfulPublication(t *testing.T) {
 	if row.LastError.Valid {
 		t.Fatalf("expected last_error null, got %q", row.LastError.String)
 	}
+	assertOutboxEventStatusCount(t, pool, persisted.EventID, operations.StatusPublished, 1)
 }
 
 func TestPublishNextOutboxEventIntegrationNoEligibleWork(t *testing.T) {
@@ -185,6 +187,7 @@ func TestPublishNextOutboxEventIntegrationFailedPublicationIsRescheduled(t *test
 	if firstRow.PublishedAt.Valid {
 		t.Fatalf("expected published_at null, got %v", firstRow.PublishedAt.Time)
 	}
+	assertOutboxEventStatusCount(t, pool, persisted.EventID, operations.StatusPublished, 0)
 
 	makeOutboxEligible(t, pool, first.OutboxID)
 	second, err := PublishNextOutboxEvent(ctx, pool, publisher.publish, time.Minute, time.Hour)
@@ -467,6 +470,23 @@ func makeOutboxEligible(t *testing.T, pool *pgxpool.Pool, outboxID string) {
 
 	if _, err := pool.Exec(context.Background(), `UPDATE outbox SET next_attempt_at = now() WHERE id = $1::uuid`, outboxID); err != nil {
 		t.Fatalf("make outbox row eligible: %v", err)
+	}
+}
+
+func assertOutboxEventStatusCount(t *testing.T, pool *pgxpool.Pool, eventID string, status string, want int) {
+	t.Helper()
+
+	var got int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT count(*) FROM event_status_history WHERE event_id = $1::uuid AND status = $2`,
+		eventID,
+		status,
+	).Scan(&got); err != nil {
+		t.Fatalf("count status %s for event %s: %v", status, eventID, err)
+	}
+	if got != want {
+		t.Fatalf("expected %d %s statuses for event %s, got %d", want, status, eventID, got)
 	}
 }
 

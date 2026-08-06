@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/operations"
 )
 
 var ErrIdempotencyConflict = errors.New("idempotency key conflict")
@@ -189,6 +190,12 @@ func existingEventIDForMatchingRequestHash(
 func insertOutboxForEvent(ctx context.Context, tx pgx.Tx, eventID string) error {
 	if _, err := tx.Exec(ctx, insertOutboxSQL, eventID); err != nil {
 		return fmt.Errorf("insert outbox row for event %s: %w", eventID, err)
+	}
+	if err := operations.InsertStatusHistory(ctx, tx, eventID, operations.StatusStored, nil); err != nil {
+		return err
+	}
+	if err := operations.InsertStatusHistory(ctx, tx, eventID, operations.StatusPendingPublication, nil); err != nil {
+		return err
 	}
 	return nil
 }
