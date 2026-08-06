@@ -116,6 +116,25 @@ func TestProcessWebhookHTTPSuccess(t *testing.T) {
 	}
 }
 
+func TestProcessWebhookSetsIdempotencyKeyFromEventID(t *testing.T) {
+	var gotIdempotencyKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIdempotencyKey = r.Header.Get("Idempotency-Key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	msg := webhookMessage(webhookPayload(server.URL))
+	msg.Values["event_id"] = "event-123"
+
+	if err := processMessage(msg); err != nil {
+		t.Fatalf("expected webhook success, got %v", err)
+	}
+	if gotIdempotencyKey != "event-123" {
+		t.Fatalf("expected Idempotency-Key event-123, got %q", gotIdempotencyKey)
+	}
+}
+
 func TestProcessWebhookUnreachableDestinationReturnsRetryableFailure(t *testing.T) {
 	err := processWebhookMessage(
 		webhookMessage(webhookPayload("http://webhook.example.test")),

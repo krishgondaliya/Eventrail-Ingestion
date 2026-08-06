@@ -522,6 +522,9 @@ func processWebhookMessage(msg redis.XMessage, client *http.Client) error {
 	if err != nil {
 		return delivery.NewPermanentFailure(fmt.Errorf("create webhook request: %w", err))
 	}
+	if eventID, ok := msg.Values["event_id"].(string); ok && eventID != "" {
+		req.Header.Set("Idempotency-Key", eventID)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
