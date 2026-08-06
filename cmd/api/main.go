@@ -13,6 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
+	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -26,16 +28,6 @@ const (
 	DefaultMaxRetries  = 5
 	DefaultBaseBackoff = 500 * time.Millisecond
 )
-
-type CreateEventRequest struct {
-	EventType string          `json:"event_type"`
-	Source    string          `json:"source"`
-	Payload   json.RawMessage `json:"payload"`
-}
-
-type CreateEventResponse struct {
-	ID string `json:"id"`
-}
 
 type Event struct {
 	ID        string          `json:"id"`
@@ -58,8 +50,8 @@ type ReplayResponse struct {
 }
 
 type SetGroupCursorRequest struct {
-	Group   string `json:"group"`   // optional, default ConsumerGroup
-	StartID string `json:"start_id"`// e.g. "0" or "0-0" or "$"
+	Group   string `json:"group"`    // optional, default ConsumerGroup
+	StartID string `json:"start_id"` // e.g. "0" or "0-0" or "$"
 }
 
 func main() {
@@ -126,68 +118,14 @@ func main() {
 		))
 	})
 
-	// --------------------
-	// POST /events (idempotent + publish)
-	// --------------------
-	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-
-		var req CreateEventRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
-			return
-		}
-
-		if req.EventType == "" || req.Source == "" || len(req.Payload) == 0 {
-			http.Error(w, "event_type, source, and payload are required", http.StatusBadRequest)
-			return
-		}
-
-		var eventID string
-		err := pgPool.QueryRow(
-			context.Background(),
-			`INSERT INTO events (event_type, source, payload, idempotency_key)
-			 VALUES ($1, $2, $3, $4)
-			 ON CONFLICT (source, idempotency_key)
-			 WHERE idempotency_key IS NOT NULL
-			 DO UPDATE SET source = EXCLUDED.source
-			 RETURNING id`,
-			req.EventType,
-			req.Source,
-			req.Payload,
-			nilIfEmpty(idempotencyKey),
-		).Scan(&eventID)
-
-		if err != nil {
-			http.Error(w, "failed to persist event", http.StatusInternalServerError)
-			return
-		}
-
-		_, err = redisClient.XAdd(context.Background(), &redis.XAddArgs{
-			Stream: EventStream,
-			Values: map[string]interface{}{
-				"event_id":   eventID,
-				"event_type": req.EventType,
-				"source":     req.Source,
-				"payload":    string(req.Payload),
-				"retry":      "0",
-				"created_at": time.Now().UTC().Format(time.RFC3339),
-			},
-		}).Result()
-
-		if err != nil {
-			log.Printf("failed to publish event %s to stream: %v", eventID, err)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(CreateEventResponse{ID: eventID})
-	})
+	persist := func(
+		ctx context.Context,
+		input ingestion.EventInput,
+		idempotencyKey string,
+	) (ingestion.PersistResult, error) {
+		return ingestion.PersistEventWithOutbox(ctx, pgPool, input, idempotencyKey)
+	}
+	http.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
 
 	// --------------------
 	// GET /events/{id}
@@ -586,13 +524,6 @@ func backoffDelay(base time.Duration, retry int) time.Duration {
 		return 10 * time.Second
 	}
 	return d
-}
-
-func nilIfEmpty(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
 }
 
 func envInt(key string, def int) int {
