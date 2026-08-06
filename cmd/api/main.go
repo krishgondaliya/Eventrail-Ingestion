@@ -618,30 +618,51 @@ func retryPump(rdb *redis.Client) {
 		}
 
 		for _, m := range members {
-			// Remove first to avoid double-publish on crash loops
-			removed, _ := rdb.ZRem(ctx, RetryZSet, m).Result()
-			if removed == 0 {
-				continue
-			}
-
-			var values map[string]interface{}
-			if err := json.Unmarshal([]byte(m), &values); err != nil {
-				continue
-			}
-
-			_, err := rdb.XAdd(ctx, &redis.XAddArgs{
-				Stream: EventStream,
-				Values: values,
-			}).Result()
-			if err != nil {
-				// If republish fails, put it back with a short delay
-				_ = rdb.ZAdd(ctx, RetryZSet, redis.Z{
-					Score:  float64(time.Now().Add(1 * time.Second).UnixMilli()),
-					Member: m,
-				}).Err()
+			if err := republishRetryMember(
+				ctx,
+				m,
+				func(ctx context.Context, values map[string]interface{}) error {
+					_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+						Stream: EventStream,
+						Values: values,
+					}).Result()
+					return err
+				},
+				func(ctx context.Context, member string) error {
+					removed, err := rdb.ZRem(ctx, RetryZSet, member).Result()
+					if err != nil {
+						return err
+					}
+					if removed == 0 {
+						return fmt.Errorf("remove retry member affected 0 rows")
+					}
+					return nil
+				},
+			); err != nil {
+				log.Printf("retry republish failed: %v", err)
 			}
 		}
 	}
+}
+
+func republishRetryMember(
+	ctx context.Context,
+	member string,
+	publish func(context.Context, map[string]interface{}) error,
+	remove func(context.Context, string) error,
+) error {
+	var values map[string]interface{}
+	if err := json.Unmarshal([]byte(member), &values); err != nil {
+		return fmt.Errorf("decode retry member: %w", err)
+	}
+
+	if err := publish(ctx, values); err != nil {
+		return fmt.Errorf("publish retry member: %w", err)
+	}
+	if err := remove(ctx, member); err != nil {
+		return fmt.Errorf("remove published retry member: %w", err)
+	}
+	return nil
 }
 
 func moveToDLQ(ctx context.Context, rdb *redis.Client, msg redis.XMessage, cause error) error {
