@@ -66,7 +66,7 @@ export interface AITriage {
   analysisLabel?: string;
   whyItFailed?: string;
   recommendedChecks?: string[];
-  redriveReadiness: "Ready" | "Not ready" | "No action needed";
+  redriveReadiness: "Ready" | "Not ready" | "Review required" | "No action needed";
   redriveExplanation: string;
   trustedSource?: {
     label: string;

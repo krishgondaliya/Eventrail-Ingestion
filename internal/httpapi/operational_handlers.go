@@ -22,6 +22,10 @@ type DLQStore interface {
 	RedriveDLQ(context.Context, string, operations.RedrivePublisher) (operations.RedriveResult, error)
 }
 
+type DLQTriageClient interface {
+	Triage(context.Context, triageRequest) (triageResponse, error)
+}
+
 type MetricsReader interface {
 	MetricsSummary(context.Context) (operations.MetricsSummary, error)
 }
@@ -54,7 +58,7 @@ func NewEventStatusHandler(store EventStatusReader) http.Handler {
 	})
 }
 
-func NewDLQHandler(store DLQStore, publish operations.RedrivePublisher) http.Handler {
+func NewDLQHandler(store DLQStore, publish operations.RedrivePublisher, triageClient DLQTriageClient) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/dlq"), "/")
 		if path == "" {
@@ -69,6 +73,10 @@ func NewDLQHandler(store DLQStore, publish operations.RedrivePublisher) http.Han
 		}
 		if len(parts) == 2 && parts[1] == "redrive" {
 			handleDLQRedrive(w, r, store, publish, parts[0])
+			return
+		}
+		if len(parts) == 2 && parts[1] == "triage" {
+			handleDLQTriage(w, r, store, triageClient, parts[0])
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -184,6 +192,35 @@ func handleDLQRedrive(w http.ResponseWriter, r *http.Request, store DLQStore, pu
 	})
 }
 
+func handleDLQTriage(w http.ResponseWriter, r *http.Request, store DLQStore, triageClient DLQTriageClient, eventID string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if triageClient == nil {
+		http.Error(w, "AI triage service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	detail, err := store.DLQDetail(r.Context(), eventID)
+	if errors.Is(err, operations.ErrDLQNotFound) {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "failed to fetch DLQ record", http.StatusInternalServerError)
+		return
+	}
+
+	triage, err := triageClient.Triage(r.Context(), triageRequestFromDLQDetail(detail))
+	if err != nil {
+		http.Error(w, "failed to generate AI triage", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, triage)
+}
+
 type eventStatusResponse struct {
 	EventID          string                    `json:"event_id"`
 	EventType        string                    `json:"event_type"`
@@ -289,4 +326,76 @@ func dlqRecordResponseFromStore(record operations.DLQRecord) dlqRecordResponse {
 		DeadLetteredAt: record.DeadLetteredAt,
 		RedrivenAt:     record.RedrivenAt,
 	}
+}
+
+func triageRequestFromDLQDetail(detail operations.DLQDetail) triageRequest {
+	request := triageRequest{
+		EventType:    detail.Record.EventType,
+		Source:       detail.Record.Source,
+		Destination:  destinationFromEventPayload(detail.Event.Payload),
+		HTTPStatus:   latestResponseCode(detail.DeliveryAttempts),
+		Error:        latestError(detail),
+		AttemptCount: detail.Record.AttemptCount,
+	}
+	if request.Destination == "" {
+		request.Destination = "Webhook destination"
+	}
+	if request.AttemptCount < 1 {
+		request.AttemptCount = 1
+	}
+	businessEventType, schemaVersion := safeMetadataFromEventPayload(detail.Event.Payload)
+	request.BusinessEventType = businessEventType
+	request.SchemaVersion = schemaVersion
+	return request
+}
+
+func latestResponseCode(attempts []operations.DeliveryAttempt) *int {
+	for i := len(attempts) - 1; i >= 0; i-- {
+		if attempts[i].ResponseCode != nil {
+			return attempts[i].ResponseCode
+		}
+	}
+	return nil
+}
+
+func latestError(detail operations.DLQDetail) string {
+	for i := len(detail.DeliveryAttempts) - 1; i >= 0; i-- {
+		if detail.DeliveryAttempts[i].Error != nil && strings.TrimSpace(*detail.DeliveryAttempts[i].Error) != "" {
+			return strings.TrimSpace(*detail.DeliveryAttempts[i].Error)
+		}
+	}
+	if detail.Record.LastError != nil && strings.TrimSpace(*detail.Record.LastError) != "" {
+		return strings.TrimSpace(*detail.Record.LastError)
+	}
+	return "Delivery failed"
+}
+
+func safeMetadataFromEventPayload(payload json.RawMessage) (*string, *string) {
+	var webhook struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &webhook); err != nil {
+		return nil, nil
+	}
+	return stringValuePointer(webhook.Data["business_event_type"]), stringValuePointer(webhook.Data["schema_version"])
+}
+
+func destinationFromEventPayload(payload json.RawMessage) string {
+	businessEventType, _ := safeMetadataFromEventPayload(payload)
+	if businessEventType != nil && *businessEventType == "invoice.paid" {
+		return "Receipt Service"
+	}
+	return ""
+}
+
+func stringValuePointer(value any) *string {
+	raw, ok := value.(string)
+	if !ok {
+		return nil
+	}
+	clean := strings.TrimSpace(raw)
+	if clean == "" {
+		return nil
+	}
+	return &clean
 }

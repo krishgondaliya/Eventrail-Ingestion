@@ -83,6 +83,7 @@ type DLQRecord struct {
 }
 
 type DLQDetail struct {
+	Event            EventMetadata
 	Record           DLQRecord
 	History          []StatusHistoryEntry
 	DeliveryAttempts []DeliveryAttempt
@@ -228,6 +229,10 @@ func (s *Store) DLQDetail(ctx context.Context, eventID string) (DLQDetail, error
 		return DLQDetail{}, err
 	}
 
+	event, err := s.fetchEvent(ctx, s.pool, eventID)
+	if err != nil {
+		return DLQDetail{}, err
+	}
 	history, err := s.fetchStatusHistory(ctx, s.pool, eventID)
 	if err != nil {
 		return DLQDetail{}, err
@@ -237,6 +242,7 @@ func (s *Store) DLQDetail(ctx context.Context, eventID string) (DLQDetail, error
 		return DLQDetail{}, err
 	}
 	return DLQDetail{
+		Event:            event,
 		Record:           record,
 		History:          history,
 		DeliveryAttempts: attempts,

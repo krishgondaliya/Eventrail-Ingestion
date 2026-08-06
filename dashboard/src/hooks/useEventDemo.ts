@@ -4,6 +4,7 @@ import {
   type DeliveryAttemptResponse,
   type EventStatusResponse,
   type MetricsSummaryResponse,
+  type TriageResponse,
   eventRailBaseURL,
 } from "../api/eventrailClient";
 import {
@@ -57,6 +58,8 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
   const [dlqDetail, setDLQDetail] = useState<EventStatusResponse | null>(null);
   const [metrics, setMetrics] = useState<MetricsSummaryResponse | null>(null);
   const [mockStats, setMockStats] = useState<MockDestinationStats | null>(null);
+  const [triage, setTriage] = useState<TriageResponse | null>(null);
+  const [triageUnavailable, setTriageUnavailable] = useState(false);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [fixedDestination, setFixedDestination] = useState(false);
@@ -123,6 +126,8 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     setDLQDetail(null);
     setMetrics(null);
     setMockStats(null);
+    setTriage(null);
+    setTriageUnavailable(false);
     setActivity([]);
     setErrorMessage(null);
     setFixedDestination(false);
@@ -139,6 +144,8 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         await refreshMetrics(controller.signal);
 
         if (status.current_status === "DELIVERED") {
+          setTriage(null);
+          setTriageUnavailable(false);
           appendActivity("Receipt successfully delivered");
           activeRun.current = null;
           return;
@@ -154,6 +161,16 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
             history: dlq.history,
             delivery_attempts: dlq.delivery_attempts,
           });
+          try {
+            const triageResponse = await eventrail.triageDLQ(eventID, controller.signal);
+            setTriage(triageResponse);
+            setTriageUnavailable(false);
+            appendActivity("Grounded triage received from trusted runbooks");
+          } catch {
+            setTriage(null);
+            setTriageUnavailable(true);
+            appendActivity("Grounded triage unavailable; DLQ inspection remains available");
+          }
           setWorkflowState("needs_attention");
           appendActivity("Receipt Service rejected the delivery");
           activeRun.current = null;
@@ -177,6 +194,8 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     setDLQDetail(null);
     setMetrics(null);
     setMockStats(null);
+    setTriage(null);
+    setTriageUnavailable(false);
     setActivity([]);
     setErrorMessage(null);
     setFixedDestination(false);
@@ -290,8 +309,15 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     if (mode === "fixture" || !eventStatus) {
       return fixtureScenario;
     }
-    return liveScenarioFromStatus(fixtureScenario, eventStatus, dlqDetail, metrics);
-  }, [dlqDetail, eventStatus, fixtureScenario, metrics, mode]);
+    return liveScenarioFromStatus(
+      fixtureScenario,
+      eventStatus,
+      dlqDetail,
+      metrics,
+      triage,
+      triageUnavailable,
+    );
+  }, [dlqDetail, eventStatus, fixtureScenario, metrics, mode, triage, triageUnavailable]);
 
   return {
     scenario,
@@ -365,6 +391,8 @@ function liveScenarioFromStatus(
   status: EventStatusResponse,
   dlq: EventStatusResponse | null,
   metrics: MetricsSummaryResponse | null,
+  triage: TriageResponse | null,
+  triageUnavailable: boolean,
 ): DemoScenario {
   const effective = dlq ?? status;
   const summaryStatus = toInternalStatus(effective.current_status);
@@ -378,7 +406,11 @@ function liveScenarioFromStatus(
     },
     timeline: timelineFromHistory(effective.history, summaryStatus),
     attempts: attemptsFromStatus(effective.delivery_attempts),
-    aiTriage: aiTriageFromStatus(summaryStatus),
+    aiTriage: triage
+      ? aiTriageFromResponse(triage)
+      : triageUnavailable
+        ? aiTriageUnavailable()
+        : aiTriageFromStatus(summaryStatus),
   };
 }
 
@@ -464,6 +496,68 @@ function aiTriageFromStatus(status: InternalStatus): AITriage {
     redriveReadiness: "No action needed",
     redriveExplanation: "EventRail is still tracking delivery for this event.",
   };
+}
+
+function aiTriageFromResponse(response: TriageResponse): AITriage {
+  const citation = response.citations[0];
+  return {
+    state: "advisory",
+    headline: headlineForCategory(response.category),
+    analysisLabel: response.analysis_mode,
+    whyItFailed: response.summary,
+    recommendedChecks: response.recommended_actions,
+    redriveReadiness:
+      response.redrive_recommendation === "not_ready" ? "Not ready" : "Review required",
+    redriveExplanation:
+      response.redrive_recommendation === "not_ready"
+        ? "Correct or verify the underlying issue before operator redrive."
+        : "Review destination state and duplicate safety before operator redrive.",
+    trustedSource: citation
+      ? {
+          label: citation.title,
+          citation: citation.chunk_id,
+        }
+      : undefined,
+  };
+}
+
+function aiTriageUnavailable(): AITriage {
+  return {
+    state: "advisory",
+    headline: "Automated analysis unavailable.",
+    analysisLabel: "Unavailable",
+    whyItFailed:
+      "EventRail could not reach the grounded triage service. The event remains durable in the DLQ.",
+    recommendedChecks: [
+      "Inspect the DLQ record and delivery attempts.",
+      "Fix the destination condition before redrive.",
+      "Retry analysis later if operator guidance is still needed.",
+    ],
+    redriveReadiness: "Not ready",
+    redriveExplanation:
+      "AI availability is not required for recovery, but the destination issue still needs operator review.",
+  };
+}
+
+function headlineForCategory(category: string): string {
+  switch (category) {
+    case "destination_validation_error":
+      return "Receipt validation issue identified.";
+    case "authentication_error":
+      return "Authentication issue identified.";
+    case "authorization_error":
+      return "Authorization issue identified.";
+    case "rate_limited":
+      return "Rate limiting identified.";
+    case "destination_outage":
+      return "Destination availability issue identified.";
+    case "schema_error":
+      return "Schema compatibility issue identified.";
+    case "routing_configuration_error":
+      return "Routing configuration issue identified.";
+    default:
+      return "Cause could not be determined confidently.";
+  }
 }
 
 function messageForAttempt(result: DeliveryAttempt["result"], code: number | null): string {

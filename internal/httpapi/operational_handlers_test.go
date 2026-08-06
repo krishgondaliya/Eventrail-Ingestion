@@ -26,6 +26,22 @@ type fakeOperationalStore struct {
 	metrics     operations.MetricsSummary
 }
 
+type fakeTriageClient struct {
+	request  triageRequest
+	response triageResponse
+	err      error
+	calls    int
+}
+
+func (c *fakeTriageClient) Triage(_ context.Context, request triageRequest) (triageResponse, error) {
+	c.calls++
+	c.request = request
+	if c.err != nil {
+		return triageResponse{}, c.err
+	}
+	return c.response, nil
+}
+
 func (s *fakeOperationalStore) EventStatus(context.Context, string) (operations.EventStatus, error) {
 	return s.eventStatus, s.eventErr
 }
@@ -97,7 +113,7 @@ func TestEventStatusHandlerMissingEventReturnsNotFound(t *testing.T) {
 func TestDLQListDefaultsToOpenRecords(t *testing.T) {
 	store := &fakeOperationalStore{}
 
-	rr := performOperationalRequest(NewDLQHandler(store, nil), http.MethodGet, "/dlq")
+	rr := performOperationalRequest(NewDLQHandler(store, nil, nil), http.MethodGet, "/dlq")
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
@@ -120,7 +136,7 @@ func TestDLQListRejectsInvalidParameters(t *testing.T) {
 
 	for _, path := range tests {
 		t.Run(path, func(t *testing.T) {
-			rr := performOperationalRequest(NewDLQHandler(&fakeOperationalStore{}, nil), http.MethodGet, path)
+			rr := performOperationalRequest(NewDLQHandler(&fakeOperationalStore{}, nil, nil), http.MethodGet, path)
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rr.Code)
 			}
@@ -133,7 +149,7 @@ func TestDLQDetailContainsHistoryAndAttempts(t *testing.T) {
 		dlqDetail: operations.DLQDetail{
 			Record: operations.DLQRecord{
 				EventID:        "event-1",
-				EventType:      "invoice.paid",
+				EventType:      "webhook",
 				Source:         "payments",
 				Status:         operations.DLQStatusOpen,
 				AttemptCount:   1,
@@ -144,7 +160,7 @@ func TestDLQDetailContainsHistoryAndAttempts(t *testing.T) {
 		},
 	}
 
-	rr := performOperationalRequest(NewDLQHandler(store, nil), http.MethodGet, "/dlq/event-1")
+	rr := performOperationalRequest(NewDLQHandler(store, nil, nil), http.MethodGet, "/dlq/event-1")
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
@@ -172,7 +188,7 @@ func TestDLQRedriveResponses(t *testing.T) {
 			store := &fakeOperationalStore{redriveErr: tt.redriveErr}
 			rr := performOperationalRequest(NewDLQHandler(store, func(context.Context, map[string]interface{}) (string, error) {
 				return "", errors.New("redis down")
-			}), http.MethodPost, "/dlq/event-1/redrive")
+			}, nil), http.MethodPost, "/dlq/event-1/redrive")
 			if rr.Code != tt.wantStatus {
 				t.Fatalf("expected status %d, got %d", tt.wantStatus, rr.Code)
 			}
@@ -186,7 +202,7 @@ func TestDLQRedriveSuccess(t *testing.T) {
 	}
 	rr := performOperationalRequest(NewDLQHandler(store, func(context.Context, map[string]interface{}) (string, error) {
 		return "1-0", nil
-	}), http.MethodPost, "/dlq/event-1/redrive")
+	}, nil), http.MethodPost, "/dlq/event-1/redrive")
 
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("expected status %d, got %d", http.StatusAccepted, rr.Code)
@@ -195,6 +211,158 @@ func TestDLQRedriveSuccess(t *testing.T) {
 	decodeJSONResponse(t, rr, &got)
 	if got.EventID != "event-1" || got.Status != operations.DLQStatusRedriven || got.StreamID != "1-0" {
 		t.Fatalf("unexpected redrive response: %#v", got)
+	}
+}
+
+func TestDLQTriageSendsSanitizedMetadataToAIService(t *testing.T) {
+	responseCode := 400
+	attemptError := "Required field invoice_id was missing"
+	client := &fakeTriageClient{
+		response: triageResponse{
+			Category:              "destination_validation_error",
+			Summary:               "The Receipt Service rejected the delivery because invoice_id was missing.",
+			RecommendedActions:    []string{"Verify the payment-to-receipt field mapping."},
+			RedriveRecommendation: "not_ready",
+			Citations: []triageCitation{{
+				RunbookID:  "receipt-validation-v1",
+				ChunkID:    "receipt-validation-v1/checks",
+				Title:      "Receipt Validation Failures",
+				SourcePath: "receipt-validation.md",
+			}},
+			AnalysisMode: "deterministic_runbook",
+		},
+	}
+	store := &fakeOperationalStore{
+		dlqDetail: operations.DLQDetail{
+			Event: operations.EventMetadata{
+				EventID:   "event-1",
+				EventType: "webhook",
+				Source:    "Payment Service",
+				Payload: json.RawMessage(`{
+					"url":"http://receipt-service.local/receipts",
+					"data":{
+						"business_event_type":"invoice.paid",
+						"invoice_id":"INV-2048",
+						"amount":500,
+						"currency":"USD",
+						"schema_version":"1"
+					}
+				}`),
+			},
+			Record: operations.DLQRecord{
+				EventID:      "event-1",
+				EventType:    "webhook",
+				Source:       "Payment Service",
+				Status:       operations.DLQStatusOpen,
+				AttemptCount: 1,
+			},
+			DeliveryAttempts: []operations.DeliveryAttempt{{
+				AttemptNumber: 1,
+				Outcome:       operations.DeliveryOutcomeFailed,
+				ResponseCode:  &responseCode,
+				Error:         &attemptError,
+			}},
+		},
+	}
+
+	rr := performOperationalRequest(NewDLQHandler(store, nil, client), http.MethodPost, "/dlq/event-1/triage")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+	}
+	if client.calls != 1 {
+		t.Fatalf("expected 1 triage call, got %d", client.calls)
+	}
+	if client.request.EventType != "webhook" {
+		t.Fatalf("expected EventRail event type webhook, got %q", client.request.EventType)
+	}
+	if client.request.BusinessEventType == nil || *client.request.BusinessEventType != "invoice.paid" {
+		t.Fatalf("expected business event type invoice.paid, got %#v", client.request.BusinessEventType)
+	}
+	if client.request.Source != "Payment Service" || client.request.Destination != "Receipt Service" {
+		t.Fatalf("unexpected source/destination: %#v", client.request)
+	}
+	if client.request.HTTPStatus == nil || *client.request.HTTPStatus != 400 {
+		t.Fatalf("expected HTTP status 400, got %#v", client.request.HTTPStatus)
+	}
+	if client.request.Error != attemptError || client.request.AttemptCount != 1 {
+		t.Fatalf("unexpected error or attempt count: %#v", client.request)
+	}
+	if client.request.SchemaVersion == nil || *client.request.SchemaVersion != "1" {
+		t.Fatalf("expected schema version 1, got %#v", client.request.SchemaVersion)
+	}
+
+	requestJSON, err := json.Marshal(client.request)
+	if err != nil {
+		t.Fatalf("marshal triage request: %v", err)
+	}
+	for _, forbidden := range []string{"receipt-service.local", "INV-2048", `"amount"`, `"currency"`, `"url"`} {
+		if strings.Contains(string(requestJSON), forbidden) {
+			t.Fatalf("triage request exposed forbidden value %q in %s", forbidden, requestJSON)
+		}
+	}
+}
+
+func TestDLQTriageReturnsAIResponse(t *testing.T) {
+	client := &fakeTriageClient{
+		response: triageResponse{
+			Category:              "destination_validation_error",
+			Summary:               "Grounded triage summary.",
+			RecommendedActions:    []string{"Verify field mapping."},
+			RedriveRecommendation: "not_ready",
+			AnalysisMode:          "deterministic_runbook",
+		},
+	}
+	store := &fakeOperationalStore{
+		dlqDetail: operations.DLQDetail{
+			Event: operations.EventMetadata{Payload: json.RawMessage(`{"data":{}}`)},
+			Record: operations.DLQRecord{
+				EventType:    "webhook",
+				Source:       "Payment Service",
+				AttemptCount: 1,
+			},
+		},
+	}
+
+	rr := performOperationalRequest(NewDLQHandler(store, nil, client), http.MethodPost, "/dlq/event-1/triage")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+	var got triageResponse
+	decodeJSONResponse(t, rr, &got)
+	if got.Category != "destination_validation_error" || got.Summary != "Grounded triage summary." {
+		t.Fatalf("unexpected triage response: %#v", got)
+	}
+}
+
+func TestDLQTriageFailureDoesNotAffectDLQDetail(t *testing.T) {
+	store := &fakeOperationalStore{
+		dlqDetail: operations.DLQDetail{
+			Record: operations.DLQRecord{EventID: "event-1", Status: operations.DLQStatusOpen},
+		},
+	}
+	client := &fakeTriageClient{err: errors.New("ai unavailable")}
+
+	triage := performOperationalRequest(NewDLQHandler(store, nil, client), http.MethodPost, "/dlq/event-1/triage")
+	if triage.Code != http.StatusBadGateway {
+		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, triage.Code)
+	}
+
+	detail := performOperationalRequest(NewDLQHandler(store, nil, client), http.MethodGet, "/dlq/event-1")
+	if detail.Code != http.StatusOK {
+		t.Fatalf("expected DLQ detail to remain available, got %d", detail.Code)
+	}
+}
+
+func TestDLQTriageRejectsNonPost(t *testing.T) {
+	rr := performOperationalRequest(NewDLQHandler(&fakeOperationalStore{}, nil, &fakeTriageClient{}), http.MethodGet, "/dlq/event-1/triage")
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, rr.Code)
+	}
+	if allow := rr.Header().Get("Allow"); allow != http.MethodPost {
+		t.Fatalf("expected Allow POST, got %q", allow)
 	}
 }
 
@@ -229,8 +397,8 @@ func TestOperationalGetHandlersRejectNonGet(t *testing.T) {
 		path    string
 	}{
 		{name: "event status", handler: NewEventStatusHandler(&fakeOperationalStore{}), path: "/events/event-1/status"},
-		{name: "DLQ list", handler: NewDLQHandler(&fakeOperationalStore{}, nil), path: "/dlq"},
-		{name: "DLQ detail", handler: NewDLQHandler(&fakeOperationalStore{}, nil), path: "/dlq/event-1"},
+		{name: "DLQ list", handler: NewDLQHandler(&fakeOperationalStore{}, nil, nil), path: "/dlq"},
+		{name: "DLQ detail", handler: NewDLQHandler(&fakeOperationalStore{}, nil, nil), path: "/dlq/event-1"},
 		{name: "metrics", handler: NewMetricsSummaryHandler(&fakeOperationalStore{}), path: "/metrics/summary"},
 	}
 
@@ -248,7 +416,7 @@ func TestOperationalGetHandlersRejectNonGet(t *testing.T) {
 }
 
 func TestDLQRedriveRejectsNonPost(t *testing.T) {
-	rr := performOperationalRequest(NewDLQHandler(&fakeOperationalStore{}, nil), http.MethodGet, "/dlq/event-1/redrive")
+	rr := performOperationalRequest(NewDLQHandler(&fakeOperationalStore{}, nil, nil), http.MethodGet, "/dlq/event-1/redrive")
 
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, rr.Code)

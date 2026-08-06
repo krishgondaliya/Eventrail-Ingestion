@@ -62,6 +62,9 @@ func TestLoadUsesDefaultsForUnsetOptionalValues(t *testing.T) {
 	if got.RedisAddr != "localhost:6379" {
 		t.Fatalf("expected Redis addr localhost:6379, got %q", got.RedisAddr)
 	}
+	if got.AIServiceURL != "http://127.0.0.1:8090" {
+		t.Fatalf("expected default AI service URL, got %q", got.AIServiceURL)
+	}
 	if got.ConsumerName != "api-1" {
 		t.Fatalf("expected default consumer api-1, got %q", got.ConsumerName)
 	}
@@ -175,6 +178,7 @@ func TestLoadParsesValidOverrides(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv("POSTGRES_DSN", secretTestDSN)
 	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("AI_SERVICE_URL", "http://ai-service:8090")
 	t.Setenv("CONSUMER_NAME", "worker-7")
 	t.Setenv("MAX_RETRIES", "9")
 	t.Setenv("BASE_BACKOFF_MS", "1250")
@@ -190,6 +194,9 @@ func TestLoadParsesValidOverrides(t *testing.T) {
 	}
 	if got.RedisAddr != "redis:6379" {
 		t.Fatalf("expected Redis addr redis:6379, got %q", got.RedisAddr)
+	}
+	if got.AIServiceURL != "http://ai-service:8090" {
+		t.Fatalf("expected AI service URL override, got %q", got.AIServiceURL)
 	}
 	if got.ConsumerName != "worker-7" {
 		t.Fatalf("expected consumer worker-7, got %q", got.ConsumerName)
@@ -226,6 +233,7 @@ func clearConfigEnv(t *testing.T) {
 	for _, key := range []string{
 		"POSTGRES_DSN",
 		"REDIS_ADDR",
+		"AI_SERVICE_URL",
 		"CONSUMER_NAME",
 		"MAX_RETRIES",
 		"BASE_BACKOFF_MS",

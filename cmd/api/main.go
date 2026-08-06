@@ -112,6 +112,7 @@ func main() {
 		log.Fatalf("failed to apply PostgreSQL migrations: %v", err)
 	}
 	operationsStore := operations.NewStore(pgPool)
+	aiTriageClient := httpapi.NewAITriageClient(cfg.AIServiceURL, nil)
 
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
@@ -196,13 +197,13 @@ func main() {
 			Stream: EventStream,
 			Values: values,
 		}).Result()
-	}))
+	}, aiTriageClient))
 	mux.Handle("/dlq/", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
 		return redisClient.XAdd(ctx, &redis.XAddArgs{
 			Stream: EventStream,
 			Values: values,
 		}).Result()
-	}))
+	}, aiTriageClient))
 	mux.Handle("/metrics/summary", httpapi.NewMetricsSummaryHandler(operationsStore))
 
 	persist := func(

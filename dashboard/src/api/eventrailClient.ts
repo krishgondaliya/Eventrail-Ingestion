@@ -56,6 +56,22 @@ export interface RedriveResponse {
   stream_id: string;
 }
 
+export interface TriageCitationResponse {
+  runbook_id: string;
+  chunk_id: string;
+  title: string;
+  source_path: string;
+}
+
+export interface TriageResponse {
+  category: string;
+  summary: string;
+  recommended_actions: string[];
+  redrive_recommendation: "not_ready" | "review_required";
+  citations: TriageCitationResponse[];
+  analysis_mode: string;
+}
+
 export interface MetricsSummaryResponse {
   total_events: number;
   pending_publication: number;
@@ -112,6 +128,14 @@ export class EventRailClient {
       signal,
     });
     return readJSON<RedriveResponse>(response);
+  }
+
+  async triageDLQ(eventID: string, signal?: AbortSignal): Promise<TriageResponse> {
+    const response = await fetch(`${this.baseURL}/dlq/${eventID}/triage`, {
+      method: "POST",
+      signal,
+    });
+    return readJSON<TriageResponse>(response);
   }
 
   async getMetrics(signal?: AbortSignal): Promise<MetricsSummaryResponse> {
