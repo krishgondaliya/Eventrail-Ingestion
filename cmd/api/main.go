@@ -21,6 +21,7 @@ import (
 	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/ingestion"
 	"github.com/krishgondaliya/eventrail-ingestion/internal/outbox"
+	"github.com/krishgondaliya/eventrail-ingestion/migrations"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -92,6 +93,10 @@ func main() {
 		log.Fatalf("failed to connect to postgres: %v", err)
 	}
 	defer pgPool.Close()
+
+	if err := migrations.Apply(ctx, pgPool); err != nil {
+		log.Fatalf("failed to apply PostgreSQL migrations: %v", err)
+	}
 
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: redisAddr,
