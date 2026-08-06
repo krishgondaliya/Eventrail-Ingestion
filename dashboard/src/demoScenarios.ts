@@ -3,7 +3,10 @@ import type { BusinessEvent, DemoScenario, TimelineStep } from "./types";
 const event: BusinessEvent = {
   invoiceNumber: "INV-2048",
   amount: "$500.00 USD",
-  eventType: "invoice.paid",
+  label: "Invoice paid",
+  businessEventType: "invoice.paid",
+  deliveryType: "webhook",
+  deliveryMethod: "Webhook",
   source: "Payment Service",
   destination: "Receipt Service",
   eventId: "6f1f4f9e-7f48-4c1d-8bcb-91d31a0b2048",
@@ -17,7 +20,10 @@ const importantDescriptions = {
   DELIVERED: "Receipt service confirmed delivery",
 } as const;
 
-function timeline(activeStatuses: TimelineStep["id"][], current: TimelineStep["id"]): TimelineStep[] {
+export function timeline(
+  activeStatuses: TimelineStep["id"][],
+  current: TimelineStep["id"],
+): TimelineStep[] {
   const steps: TimelineStep["id"][] = [
     "RECEIVED",
     "STORED",

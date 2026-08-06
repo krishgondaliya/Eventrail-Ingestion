@@ -13,8 +13,11 @@ export function EventSummary({ scenario }: EventSummaryProps) {
       <div className="summary-main">
         <div>
           <p className="section-kicker">Business event</p>
-          <h2 id="event-summary-title">{scenario.event.invoiceNumber}</h2>
-          <p className="amount">{scenario.event.amount}</p>
+          <h2 id="event-summary-title">{scenario.event.label}</h2>
+          <p className="amount">
+            {scenario.event.invoiceNumber} / {scenario.event.amount}
+          </p>
+          <p className="delivery-method">Delivery method: {scenario.event.deliveryMethod}</p>
         </div>
         <span className={`badge badge-${status.tone}`}>{status.label}</span>
       </div>
@@ -26,8 +29,12 @@ export function EventSummary({ scenario }: EventSummaryProps) {
           </dd>
         </div>
         <div>
-          <dt>Event type</dt>
-          <dd>{scenario.event.eventType}</dd>
+          <dt>Business type</dt>
+          <dd>{scenario.event.businessEventType}</dd>
+        </div>
+        <div>
+          <dt>EventRail type</dt>
+          <dd className="technical-value">{scenario.event.deliveryType}</dd>
         </div>
         <div>
           <dt>Event ID</dt>

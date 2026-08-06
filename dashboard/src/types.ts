@@ -11,6 +11,20 @@ export type InternalStatus =
 
 export type ScenarioKey = "healthy" | "temporary" | "validation" | "recovered";
 
+export type DemoMode = "live" | "fixture";
+
+export type LiveWorkflowState =
+  | "idle"
+  | "configuring_destination"
+  | "creating_event"
+  | "tracking"
+  | "retrying"
+  | "needs_attention"
+  | "fixing_destination"
+  | "redriving"
+  | "delivered"
+  | "failed";
+
 export type TimelineState = "complete" | "current" | "future";
 
 export interface Metric {
@@ -22,7 +36,10 @@ export interface Metric {
 export interface BusinessEvent {
   invoiceNumber: string;
   amount: string;
-  eventType: string;
+  label: string;
+  businessEventType: string;
+  deliveryType: string;
+  deliveryMethod: string;
   source: string;
   destination: string;
   eventId: string;
@@ -46,6 +63,7 @@ export interface DeliveryAttempt {
 export interface AITriage {
   state: "calm" | "advisory" | "success";
   headline: string;
+  analysisLabel?: string;
   whyItFailed?: string;
   recommendedChecks?: string[];
   redriveReadiness: "Ready" | "Not ready" | "No action needed";
@@ -66,4 +84,10 @@ export interface DemoScenario {
   timeline: TimelineStep[];
   attempts: DeliveryAttempt[];
   aiTriage: AITriage;
+}
+
+export interface ActivityEntry {
+  id: number;
+  time: string;
+  message: string;
 }

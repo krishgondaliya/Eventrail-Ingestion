@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/krishgondaliya/eventrail-ingestion/internal/httpapi"
 )
 
 const (
@@ -50,7 +52,7 @@ type statsResponse struct {
 func main() {
 	server := newReceiptServer()
 	log.Println("mock destination starting on :8081")
-	log.Fatal(http.ListenAndServe(":8081", server.routes()))
+	log.Fatal(http.ListenAndServe(":8081", httpapi.WithCORS(server.routes(), dashboardOrigins())))
 }
 
 func newReceiptServer() *receiptServer {
@@ -206,5 +208,12 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		log.Printf("encode response failed: %v", err)
+	}
+}
+
+func dashboardOrigins() []string {
+	return []string{
+		"http://localhost:5173",
+		"http://127.0.0.1:5173",
 	}
 }

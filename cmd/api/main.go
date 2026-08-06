@@ -185,23 +185,25 @@ func main() {
 			return redisClient.Ping(ctx).Err()
 		},
 	)
-	http.Handle("/health/live", httpapi.NewLivenessHandler())
-	http.Handle("/health/ready", readinessHandler)
-	http.Handle("/health", readinessHandler)
-	http.Handle("/version", httpapi.NewVersionHandler("eventrail-api", version, commit, builtAt))
-	http.Handle("/dlq", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
+	mux := http.NewServeMux()
+
+	mux.Handle("/health/live", httpapi.NewLivenessHandler())
+	mux.Handle("/health/ready", readinessHandler)
+	mux.Handle("/health", readinessHandler)
+	mux.Handle("/version", httpapi.NewVersionHandler("eventrail-api", version, commit, builtAt))
+	mux.Handle("/dlq", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
 		return redisClient.XAdd(ctx, &redis.XAddArgs{
 			Stream: EventStream,
 			Values: values,
 		}).Result()
 	}))
-	http.Handle("/dlq/", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
+	mux.Handle("/dlq/", httpapi.NewDLQHandler(operationsStore, func(ctx context.Context, values map[string]interface{}) (string, error) {
 		return redisClient.XAdd(ctx, &redis.XAddArgs{
 			Stream: EventStream,
 			Values: values,
 		}).Result()
 	}))
-	http.Handle("/metrics/summary", httpapi.NewMetricsSummaryHandler(operationsStore))
+	mux.Handle("/metrics/summary", httpapi.NewMetricsSummaryHandler(operationsStore))
 
 	persist := func(
 		ctx context.Context,
@@ -210,13 +212,13 @@ func main() {
 	) (ingestion.PersistResult, error) {
 		return ingestion.PersistEventWithOutbox(ctx, pgPool, input, idempotencyKey)
 	}
-	http.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
+	mux.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
 	eventStatusHandler := httpapi.NewEventStatusHandler(operationsStore)
 
 	// --------------------
 	// GET /events/{id}
 	// --------------------
-	http.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") {
 			eventStatusHandler.ServeHTTP(w, r)
 			return
@@ -261,7 +263,7 @@ func main() {
 		json.NewEncoder(w).Encode(evt)
 	})
 
-	http.HandleFunc("/replay", newReplayHandler(
+	mux.HandleFunc("/replay", newReplayHandler(
 		func(ctx context.Context, query string, args ...any) (replayRows, error) {
 			return pgPool.Query(ctx, query, args...)
 		},
@@ -277,7 +279,7 @@ func main() {
 	// POST /consumer-groups/set-cursor (consumer replay)
 	// Sets the group cursor so consumers can reprocess history.
 	// --------------------
-	http.HandleFunc("/consumer-groups/set-cursor", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/consumer-groups/set-cursor", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -314,7 +316,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":8080",
-		Handler:           http.DefaultServeMux,
+		Handler:           httpapi.WithCORS(mux, dashboardOrigins()),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -347,5 +349,12 @@ func main() {
 		}
 		cancelApp()
 		workers.Wait()
+	}
+}
+
+func dashboardOrigins() []string {
+	return []string{
+		"http://localhost:5173",
+		"http://127.0.0.1:5173",
 	}
 }

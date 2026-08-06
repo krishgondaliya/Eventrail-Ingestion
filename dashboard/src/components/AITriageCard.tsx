@@ -12,7 +12,7 @@ export function AITriageCard({ triage }: AITriageCardProps) {
           <p className="section-kicker">Advisory guidance</p>
           <h2 id="ai-title">AI Exception Assistant</h2>
         </div>
-        <span className="badge badge-neutral">Trusted runbooks</span>
+        <span className="badge badge-neutral">{triage.analysisLabel ?? "Trusted runbooks"}</span>
       </div>
 
       <div className="ai-body">
