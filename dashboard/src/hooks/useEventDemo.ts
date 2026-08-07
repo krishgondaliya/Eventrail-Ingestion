@@ -24,6 +24,7 @@ import type {
   Metric,
   ScenarioKey,
   TimelineStep,
+  ToastMessage,
 } from "../types";
 
 const pollIntervalMs = 1000;
@@ -35,6 +36,7 @@ export interface EventDemoState {
   connectionText: string;
   workflowState: LiveWorkflowState;
   activity: ActivityEntry[];
+  toasts: ToastMessage[];
   eventID: string | null;
   mockStats: MockDestinationStats | null;
   isRunActive: boolean;
@@ -61,17 +63,26 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
   const [triage, setTriage] = useState<TriageResponse | null>(null);
   const [triageUnavailable, setTriageUnavailable] = useState(false);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [fixedDestination, setFixedDestination] = useState(false);
   const activeRun = useRef<AbortController | null>(null);
   const activityID = useRef(0);
+  const toastID = useRef(0);
+  const seenToastKeys = useRef(new Set<string>());
+  const toastTimers = useRef<number[]>([]);
 
   const fixtureScenario = useMemo(
     () => demoScenarios.find((scenario) => scenario.key === selectedKey) ?? demoScenarios[0],
     [selectedKey],
   );
 
-  const appendActivity = useCallback((message: string) => {
+  const appendActivity = useCallback(
+    (
+      message: string,
+      detail?: string,
+      tone: ActivityEntry["tone"] = "neutral",
+    ) => {
     const entry = {
       id: activityID.current,
       time: new Date().toLocaleTimeString([], {
@@ -80,10 +91,31 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         second: "2-digit",
       }),
       message,
+      detail,
+      tone,
     };
     activityID.current += 1;
     setActivity((current) => [...current, entry]);
-  }, []);
+    },
+    [],
+  );
+
+  const showToast = useCallback(
+    (key: string, message: string, tone: ToastMessage["tone"] = "neutral") => {
+      if (seenToastKeys.current.has(key)) {
+        return;
+      }
+      seenToastKeys.current.add(key);
+      const id = toastID.current;
+      toastID.current += 1;
+      setToasts((current) => [...current.slice(-2), { id, key, message, tone }]);
+      const timer = window.setTimeout(() => {
+        setToasts((current) => current.filter((toast) => toast.id !== id));
+      }, 4200);
+      toastTimers.current.push(timer);
+    },
+    [],
+  );
 
   const abortActiveRun = useCallback(() => {
     activeRun.current?.abort();
@@ -129,6 +161,8 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     setTriage(null);
     setTriageUnavailable(false);
     setActivity([]);
+    setToasts([]);
+    seenToastKeys.current.clear();
     setErrorMessage(null);
     setFixedDestination(false);
   }, [abortActiveRun, selectedKey]);
@@ -140,18 +174,30 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
       while (!controller.signal.aborted) {
         const status = await eventrail.getEventStatus(eventID, controller.signal);
         setEventStatus(status);
-        updateWorkflowFromStatus(status, setWorkflowState, appendActivity);
+        updateWorkflowFromStatus(status, setWorkflowState, appendActivity, showToast);
         await refreshMetrics(controller.signal);
 
         if (status.current_status === "DELIVERED") {
           setTriage(null);
           setTriageUnavailable(false);
-          appendActivity("Receipt successfully delivered");
+          appendActivity(
+            "Receipt delivered",
+            "The Receipt Service confirmed successful delivery.",
+            "success",
+          );
+          showToast("delivered", "Receipt delivered", "success");
           activeRun.current = null;
           return;
         }
 
         if (status.current_status === "DEAD_LETTERED") {
+          setWorkflowState("triage_loading");
+          appendActivity(
+            "Delivery requires attention",
+            "Receipt Service rejected the event because invoice_id was missing.",
+            "danger",
+          );
+          showToast("needs-attention", "Delivery requires attention", "danger");
           const dlq = await eventrail.getDLQDetail(eventID, controller.signal);
           setDLQDetail({
             event_id: dlq.record.event_id,
@@ -165,14 +211,23 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
             const triageResponse = await eventrail.triageDLQ(eventID, controller.signal);
             setTriage(triageResponse);
             setTriageUnavailable(false);
-            appendActivity("Grounded triage received from trusted runbooks");
+            setWorkflowState("triage_ready");
+            appendActivity(
+              "Grounded guidance ready",
+              "Trusted runbook recommendations are available.",
+              "active",
+            );
+            showToast("triage-ready", "Grounded guidance ready", "neutral");
           } catch {
             setTriage(null);
             setTriageUnavailable(true);
-            appendActivity("Grounded triage unavailable; DLQ inspection remains available");
+            setWorkflowState("needs_attention");
+            appendActivity(
+              "Automated analysis unavailable",
+              "The event remains safely stored and recovery controls remain available.",
+              "warning",
+            );
           }
-          setWorkflowState("needs_attention");
-          appendActivity("Receipt Service rejected the delivery");
           activeRun.current = null;
           return;
         }
@@ -180,7 +235,7 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         await sleep(pollIntervalMs, controller.signal);
       }
     },
-    [appendActivity, eventrail, refreshMetrics],
+    [appendActivity, eventrail, refreshMetrics, showToast],
   );
 
   const runDemo = useCallback(() => {
@@ -197,13 +252,19 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     setTriage(null);
     setTriageUnavailable(false);
     setActivity([]);
+    setToasts([]);
+    seenToastKeys.current.clear();
     setErrorMessage(null);
     setFixedDestination(false);
     activityID.current = 0;
 
     void (async () => {
       try {
-        appendActivity("Configuring Receipt Service");
+        appendActivity(
+          "Configuring destination",
+          "Preparing the Receipt Service for this scenario.",
+          "neutral",
+        );
         if (selectedKey === "temporary") {
           await destination.setMode("healthy", 1, controller.signal);
         } else if (selectedKey === "validation" || selectedKey === "recovered") {
@@ -213,7 +274,11 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         }
 
         setWorkflowState("creating_event");
-        appendActivity("Invoice payment event submitted for receipt delivery");
+        appendActivity(
+          "Payment event submitted",
+          "The invoice payment was accepted for receipt delivery.",
+          "active",
+        );
         const created = await eventrail.createEvent(
           {
             event_type: "webhook",
@@ -231,7 +296,11 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
           `dashboard-${selectedKey}-${Date.now()}`,
           controller.signal,
         );
-        appendActivity("Tracking EventRail status");
+        appendActivity(
+          "Waiting for delivery",
+          "EventRail is tracking durable status changes.",
+          "neutral",
+        );
         setWorkflowState("tracking");
         await pollStatus(created.id, controller);
       } catch (error) {
@@ -242,11 +311,16 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         setWorkflowState("failed");
         setBackendAvailable(false);
         setErrorMessage(error instanceof Error ? error.message : "Demo run failed");
-        appendActivity("Demo stopped because a request failed");
+        appendActivity(
+          "Request failure",
+          "EventRail could not be reached. The current event remains visible.",
+          "danger",
+        );
+        showToast("request-failure", "EventRail could not be reached", "danger");
         activeRun.current = null;
       }
     })();
-  }, [abortActiveRun, appendActivity, destination, eventrail, pollStatus, selectedKey]);
+  }, [abortActiveRun, appendActivity, destination, eventrail, pollStatus, selectedKey, showToast]);
 
   const openFixturePreview = useCallback(() => {
     abortActiveRun();
@@ -259,7 +333,11 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     const controller = new AbortController();
     setWorkflowState("fixing_destination");
     setErrorMessage(null);
-    appendActivity("Setting Receipt Service back to healthy");
+    appendActivity(
+      "Correcting destination",
+      "The operator is resolving the receipt validation issue.",
+      "active",
+    );
 
     void destination
       .setMode("healthy", 0, controller.signal)
@@ -268,13 +346,18 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         setMockStats(stats);
         setFixedDestination(true);
         setWorkflowState("needs_attention");
-        appendActivity("Receipt Service is healthy; redrive is ready for operator approval");
+        appendActivity(
+          "Destination corrected",
+          "The operator marked the destination as healthy.",
+          "success",
+        );
+        showToast("destination-corrected", "Destination corrected", "success");
       })
       .catch((error) => {
         setWorkflowState("failed");
         setErrorMessage(error instanceof Error ? error.message : "Fix destination failed");
       });
-  }, [appendActivity, destination]);
+  }, [appendActivity, destination, showToast]);
 
   const redriveEvent = useCallback(() => {
     const eventID = eventStatus?.event_id ?? dlqDetail?.event_id;
@@ -286,12 +369,21 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     const controller = new AbortController();
     activeRun.current = controller;
     setWorkflowState("redriving");
-    appendActivity("Operator redrive accepted");
+    appendActivity(
+      "Redrive accepted",
+      "The same event identity was submitted for another delivery attempt.",
+      "active",
+    );
+    showToast("redrive-accepted", "Redrive accepted", "neutral");
 
     void (async () => {
       try {
         await eventrail.redrive(eventID, controller.signal);
-        appendActivity("Receipt delivery restarted");
+        appendActivity(
+          "Receipt delivery restarted",
+          "EventRail is sending the original event again after operator approval.",
+          "neutral",
+        );
         await pollStatus(eventID, controller);
       } catch (error) {
         if (controller.signal.aborted) {
@@ -299,11 +391,20 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         }
         setWorkflowState("failed");
         setErrorMessage(error instanceof Error ? error.message : "Redrive failed");
-        appendActivity("Redrive failed");
+        appendActivity("Request failure", "Redrive could not complete.", "danger");
+        showToast("request-failure", "Request failed", "danger");
         activeRun.current = null;
       }
     })();
-  }, [abortActiveRun, appendActivity, dlqDetail?.event_id, eventStatus?.event_id, eventrail, pollStatus]);
+  }, [
+    abortActiveRun,
+    appendActivity,
+    dlqDetail?.event_id,
+    eventStatus?.event_id,
+    eventrail,
+    pollStatus,
+    showToast,
+  ]);
 
   const scenario = useMemo(() => {
     if (mode === "fixture" || !eventStatus) {
@@ -331,6 +432,7 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
           : "Backend unavailable",
     workflowState,
     activity,
+    toasts,
     eventID: eventStatus?.event_id ?? dlqDetail?.event_id ?? null,
     mockStats,
     isRunActive:
@@ -338,10 +440,11 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
       workflowState === "creating_event" ||
       workflowState === "tracking" ||
       workflowState === "retrying" ||
+      workflowState === "triage_loading" ||
       workflowState === "fixing_destination" ||
       workflowState === "redriving",
-    canRecover: workflowState === "needs_attention",
-    canRedrive: workflowState === "needs_attention" && fixedDestination,
+    canRecover: workflowState === "needs_attention" || workflowState === "triage_ready",
+    canRedrive: (workflowState === "needs_attention" || workflowState === "triage_ready") && fixedDestination,
     errorMessage,
     runDemo,
     openFixturePreview,
@@ -354,17 +457,42 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
 function updateWorkflowFromStatus(
   status: EventStatusResponse,
   setWorkflowState: (state: LiveWorkflowState) => void,
-  appendActivity: (message: string) => void,
+  appendActivity: (
+    message: string,
+    detail?: string,
+    tone?: ActivityEntry["tone"],
+  ) => void,
+  showToast: (key: string, message: string, tone?: ToastMessage["tone"]) => void,
 ) {
   const statuses = status.history.map((entry) => entry.status);
   if (statuses.includes("STORED") || statuses.includes("PENDING_PUBLICATION")) {
-    appendOnce(status.event_id, "Event safely stored", appendActivity);
+    appendOnce(
+      status.event_id,
+      "Event safely stored",
+      appendActivity,
+      "The event was recorded before asynchronous delivery began.",
+      "success",
+    );
+    showToast("stored", "Event safely stored", "success");
   }
   if (statuses.includes("PUBLISHED")) {
-    appendOnce(status.event_id, "Receipt delivery started", appendActivity);
+    appendOnce(
+      status.event_id,
+      "Receipt delivery started",
+      appendActivity,
+      "The delivery worker is sending the event to the Receipt Service.",
+      "active",
+    );
   }
   if (statuses.includes("RETRYING")) {
-    appendOnce(status.event_id, "Temporary failure queued for retry", appendActivity);
+    appendOnce(
+      status.event_id,
+      "Automatic retry scheduled",
+      appendActivity,
+      "EventRail will try delivery again.",
+      "warning",
+    );
+    showToast("retry-scheduled", "Automatic retry scheduled", "warning");
   }
   if (status.current_status === "DELIVERED") {
     setWorkflowState("delivered");
@@ -377,13 +505,23 @@ function updateWorkflowFromStatus(
 
 const seenActivity = new Set<string>();
 
-function appendOnce(eventID: string, message: string, appendActivity: (message: string) => void) {
+function appendOnce(
+  eventID: string,
+  message: string,
+  appendActivity: (
+    message: string,
+    detail?: string,
+    tone?: ActivityEntry["tone"],
+  ) => void,
+  detail?: string,
+  tone?: ActivityEntry["tone"],
+) {
   const key = `${eventID}:${message}`;
   if (seenActivity.has(key)) {
     return;
   }
   seenActivity.add(key);
-  appendActivity(message);
+  appendActivity(message, detail, tone);
 }
 
 function liveScenarioFromStatus(

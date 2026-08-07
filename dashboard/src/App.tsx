@@ -3,13 +3,16 @@ import "./App.css";
 import { AITriageCard } from "./components/AITriageCard";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AttemptHistory } from "./components/AttemptHistory";
+import { BusinessOutcomeCard } from "./components/BusinessOutcomeCard";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { DemoControls } from "./components/DemoControls";
 import { DemoRunPanel } from "./components/DemoRunPanel";
 import { EventSummary } from "./components/EventSummary";
 import { EventTimeline } from "./components/EventTimeline";
+import { GuidedDemoBanner } from "./components/GuidedDemoBanner";
 import { Header } from "./components/Header";
 import { MetricsOverview } from "./components/MetricsOverview";
+import { ToastRegion } from "./components/ToastRegion";
 import { demoScenarios } from "./demoScenarios";
 import { useEventDemo } from "./hooks/useEventDemo";
 import type { ScenarioKey } from "./types";
@@ -40,6 +43,16 @@ function App() {
         onFixDestination={demo.fixDestination}
         onRedriveEvent={demo.redriveEvent}
       />
+      <GuidedDemoBanner
+        mode={demo.mode}
+        scenario={demo.scenario}
+        workflowState={demo.workflowState}
+      />
+      <BusinessOutcomeCard
+        mode={demo.mode}
+        scenario={demo.scenario}
+        workflowState={demo.workflowState}
+      />
       <MetricsOverview metrics={demo.scenario.metrics} />
       <EventSummary scenario={demo.scenario} />
       <EventTimeline steps={demo.scenario.timeline} />
@@ -48,6 +61,7 @@ function App() {
         <AITriageCard triage={demo.scenario.aiTriage} />
       </section>
       <ActivityFeed activity={demo.activity} />
+      <ToastRegion toasts={demo.toasts} />
       <DemoControls
         scenarios={demoScenarios}
         selectedKey={selectedKey}

@@ -20,12 +20,14 @@ export type LiveWorkflowState =
   | "tracking"
   | "retrying"
   | "needs_attention"
+  | "triage_loading"
+  | "triage_ready"
   | "fixing_destination"
   | "redriving"
   | "delivered"
   | "failed";
 
-export type TimelineState = "complete" | "current" | "future";
+export type TimelineState = "complete" | "current" | "future" | "skipped";
 
 export interface Metric {
   label: string;
@@ -93,4 +95,13 @@ export interface ActivityEntry {
   id: number;
   time: string;
   message: string;
+  detail?: string;
+  tone: "neutral" | "success" | "warning" | "danger" | "active";
+}
+
+export interface ToastMessage {
+  id: number;
+  key: string;
+  message: string;
+  tone: "neutral" | "success" | "warning" | "danger";
 }

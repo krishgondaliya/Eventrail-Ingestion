@@ -15,15 +15,19 @@ export function EventTimeline({ steps }: EventTimelineProps) {
       <ol className="timeline">
         {steps.map((step, index) => {
           const presentation = presentStatus(step.id);
+          const marker = step.state === "complete" ? "OK" : step.state === "skipped" ? "-" : index + 1;
           return (
             <li className={`timeline-step timeline-${step.state}`} key={`${step.id}-${index}`}>
               <div className="timeline-marker" aria-hidden="true">
-                {index + 1}
+                {marker}
               </div>
               <div className="timeline-copy">
                 <h3>{presentation.label}</h3>
                 <p>{step.description ?? presentation.detail}</p>
-                {step.id === "DEAD_LETTERED" ? <span>Internal state: DEAD_LETTERED</span> : null}
+                {step.state === "skipped" ? <span>Not required for this outcome</span> : null}
+                {step.id === "DEAD_LETTERED" && step.state !== "skipped" ? (
+                  <span>Event is safe; operator action required</span>
+                ) : null}
               </div>
             </li>
           );

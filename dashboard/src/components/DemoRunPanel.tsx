@@ -26,6 +26,10 @@ export function DemoRunPanel({
   onRedriveEvent,
 }: DemoRunPanelProps) {
   const runDisabled = backendAvailable === false;
+  const runLabel = runButtonLabel(workflowState, isRunActive);
+  const fixLabel =
+    workflowState === "fixing_destination" ? "Correcting destination..." : "Fix destination";
+  const redriveLabel = workflowState === "redriving" ? "Sending redrive..." : "Redrive event";
 
   return (
     <section className="run-panel" aria-labelledby="run-panel-title">
@@ -38,7 +42,7 @@ export function DemoRunPanel({
       </div>
       <div className="run-actions">
         <button className="primary-button" type="button" onClick={onRunDemo} disabled={runDisabled}>
-          {isRunActive ? "Restart Demo" : "Run Demo"}
+          {runLabel}
         </button>
         <button
           className="secondary-button"
@@ -46,7 +50,7 @@ export function DemoRunPanel({
           onClick={onFixDestination}
           disabled={!canRecover}
         >
-          Fix destination
+          {fixLabel}
         </button>
         <button
           className="secondary-button"
@@ -54,7 +58,7 @@ export function DemoRunPanel({
           onClick={onRedriveEvent}
           disabled={!canRedrive}
         >
-          Redrive event
+          {redriveLabel}
         </button>
       </div>
     </section>
@@ -70,7 +74,11 @@ function activityText(state: LiveWorkflowState): string {
     case "tracking":
       return "Watching EventRail process the delivery.";
     case "retrying":
-      return "Temporary failure detected; retry is scheduled.";
+      return "Waiting for automatic retry after a temporary destination failure.";
+    case "triage_loading":
+      return "Analyzing the permanent failure with trusted guidance.";
+    case "triage_ready":
+      return "Guidance is ready; review it before recovering the event.";
     case "needs_attention":
       return "Automatic recovery stopped safely; operator action is required.";
     case "fixing_destination":
@@ -83,5 +91,26 @@ function activityText(state: LiveWorkflowState): string {
       return "The live demo stopped because a request failed.";
     default:
       return "Choose a scenario and run a live EventRail delivery.";
+  }
+}
+
+function runButtonLabel(state: LiveWorkflowState, isRunActive: boolean): string {
+  switch (state) {
+    case "configuring_destination":
+      return "Configuring destination...";
+    case "creating_event":
+      return "Creating event...";
+    case "tracking":
+      return "Waiting for delivery...";
+    case "retrying":
+      return "Waiting for automatic retry...";
+    case "triage_loading":
+      return "Analyzing failure...";
+    case "fixing_destination":
+      return "Correcting destination...";
+    case "redriving":
+      return "Sending redrive...";
+    default:
+      return isRunActive ? "Restart Demo" : "Run Demo";
   }
 }

@@ -38,7 +38,14 @@ export function timeline(
   return steps.map((id) => ({
     id,
     description: importantDescriptions[id as keyof typeof importantDescriptions],
-    state: id === current ? "current" : activeStatuses.includes(id) ? "complete" : "future",
+    state:
+      id === current
+        ? "current"
+        : activeStatuses.includes(id)
+          ? "complete"
+          : current === "DELIVERED" && (id === "RETRYING" || id === "DEAD_LETTERED" || id === "REDRIVEN")
+            ? "skipped"
+            : "future",
   }));
 }
 

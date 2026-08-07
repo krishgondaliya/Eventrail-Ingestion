@@ -8,11 +8,11 @@ export function AITriageCard({ triage }: AITriageCardProps) {
   const badge = badgeForMode(triage);
 
   return (
-    <section className={`ai-card ai-${triage.state}`} aria-labelledby="ai-title">
+    <section className={`ai-card ai-${triage.state}`} aria-labelledby="guidance-title">
       <div className="ai-heading">
         <div>
           <p className="section-kicker">Advisory guidance</p>
-          <h2 id="ai-title">AI Exception Assistant</h2>
+          <h2 id="guidance-title">Exception Guidance</h2>
         </div>
         <span className="badge badge-neutral">{badge}</span>
       </div>
