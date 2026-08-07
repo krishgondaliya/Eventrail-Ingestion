@@ -6,6 +6,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from eventrail_ai.explainer import (
+    DeterministicExplanationProvider,
+    ExplainerEngine,
+    OllamaExplanationProvider,
+    OpenAIExplanationProvider,
+)
 from eventrail_ai.retrieval import RetrievalResult
 from eventrail_ai.triage import (
     Citation,
@@ -231,7 +237,8 @@ def create_engine_from_environment(
     openai_client: object | None = None,
     ollama_client: object | None = None,
 ) -> TriageEngine:
-    env = env or os.environ
+    if env is None:
+        env = os.environ
     provider_name = env.get("TRIAGE_PROVIDER", "deterministic").strip().lower() or "deterministic"
     if provider_name == "deterministic":
         return TriageEngine(provider=DeterministicTriageProvider())
@@ -265,6 +272,54 @@ def create_engine_from_environment(
         client=openai_client,
     )
     return TriageEngine(provider=provider, fallback_provider=DeterministicTriageProvider())
+
+
+def create_explainer_engine_from_environment(
+    env: dict[str, str] | None = None,
+    openai_client: object | None = None,
+    ollama_client: object | None = None,
+) -> ExplainerEngine:
+    if env is None:
+        env = os.environ
+    provider_name = env.get("TRIAGE_PROVIDER", "deterministic").strip().lower() or "deterministic"
+    if provider_name == "deterministic":
+        return ExplainerEngine(provider=DeterministicExplanationProvider())
+    if provider_name == "ollama":
+        model = env.get("OLLAMA_MODEL", "qwen3:4b").strip()
+        if not model:
+            raise ValueError("OLLAMA_MODEL must not be blank")
+        timeout_seconds = _positive_float(
+            env.get("OLLAMA_TIMEOUT_SECONDS", "45"),
+            "OLLAMA_TIMEOUT_SECONDS",
+        )
+        provider = OllamaExplanationProvider(
+            OllamaProviderConfig(
+                base_url=_normalized_base_url(env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")),
+                model=model,
+                timeout_seconds=timeout_seconds,
+            ),
+            client=ollama_client,
+        )
+        return ExplainerEngine(
+            provider=provider,
+            fallback_provider=DeterministicExplanationProvider(),
+        )
+    if provider_name != "openai":
+        raise ValueError("TRIAGE_PROVIDER must be deterministic, openai, or ollama")
+
+    api_key = env.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is required when TRIAGE_PROVIDER=openai")
+    model = env.get("OPENAI_MODEL", "gpt-5").strip() or "gpt-5"
+    timeout_seconds = _positive_float(env.get("OPENAI_TIMEOUT_SECONDS", "7"), "OPENAI_TIMEOUT_SECONDS")
+    provider = OpenAIExplanationProvider(
+        OpenAIProviderConfig(api_key=api_key, model=model, timeout_seconds=timeout_seconds),
+        client=openai_client,
+    )
+    return ExplainerEngine(
+        provider=provider,
+        fallback_provider=DeterministicExplanationProvider(),
+    )
 
 
 def _classify(request: TriageRequest) -> str:
