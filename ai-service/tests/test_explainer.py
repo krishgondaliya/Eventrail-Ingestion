@@ -207,6 +207,31 @@ def test_model_recovery_status_field_is_rejected_and_falls_back() -> None:
     assert body["recovery_status"] == "not_ready"
 
 
+def test_model_evidence_field_is_rejected_and_falls_back() -> None:
+    fake = FakeOpenAIClient(
+        valid_explanation_payload(
+            extra={
+                "evidence": [
+                    {
+                        "type": "delivery_attempt",
+                        "description": "Attempt 99 returned HTTP 200.",
+                    }
+                ]
+            }
+        )
+    )
+    client = TestClient(create_app(env=openai_env(), openai_client=fake))
+
+    response = client.post("/explain", json=validation_failure_snapshot())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["analysis_mode"] == "deterministic_fallback"
+    assert body["provider"] == "deterministic"
+    assert "Attempt 1 returned HTTP 400." in [item["description"] for item in body["evidence"]]
+    assert "Attempt 99 returned HTTP 200." not in response.text
+
+
 @pytest.mark.parametrize("status", [401, 403, 404, 429])
 def test_nonvalidation_4xx_uses_generic_explanation(status: int) -> None:
     body = validation_failure_snapshot()
@@ -474,6 +499,7 @@ def test_snapshot_consistency_is_validated(
 
 def test_empty_env_mapping_ignores_process_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRIAGE_PROVIDER", "openai")
+    monkeypatch.setenv("EXPLAIN_PROVIDER", "openai")
     client = TestClient(create_app(env={}))
 
     triage = client.post(
@@ -495,6 +521,98 @@ def test_empty_env_mapping_ignores_process_environment(monkeypatch: pytest.Monke
     assert triage.json()["provider"] == "deterministic"
     assert explain.status_code == 200
     assert explain.json()["provider"] == "deterministic"
+
+
+def test_explain_provider_openai_can_differ_from_deterministic_triage() -> None:
+    fake = FakeOpenAIClient(valid_explanation_payload())
+    client = TestClient(
+        create_app(
+            env={
+                "TRIAGE_PROVIDER": "deterministic",
+                "EXPLAIN_PROVIDER": "openai",
+                "OPENAI_API_KEY": SECRET_KEY,
+                "OPENAI_MODEL": "gpt-5.4-mini",
+            },
+            openai_client=fake,
+        )
+    )
+
+    triage = client.post("/triage", json=triage_body())
+    explain = client.post("/explain", json=validation_failure_snapshot())
+
+    assert triage.status_code == 200
+    assert triage.json()["provider"] == "deterministic"
+    assert explain.status_code == 200
+    assert explain.json()["provider"] == "openai"
+    assert explain.json()["model"] == "gpt-5.4-mini"
+
+
+def test_explain_provider_openai_requires_api_key() -> None:
+    with pytest.raises(ValueError, match="OPENAI_API_KEY is required when EXPLAIN_PROVIDER=openai"):
+        create_app(env={"TRIAGE_PROVIDER": "deterministic", "EXPLAIN_PROVIDER": "openai"})
+
+
+def test_explain_provider_openai_uses_python_default_model_when_absent() -> None:
+    fake = FakeOpenAIClient(valid_explanation_payload())
+    client = TestClient(
+        create_app(
+            env={
+                "TRIAGE_PROVIDER": "deterministic",
+                "EXPLAIN_PROVIDER": "openai",
+                "OPENAI_API_KEY": SECRET_KEY,
+            },
+            openai_client=fake,
+        )
+    )
+
+    response = client.post("/explain", json=validation_failure_snapshot())
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "openai"
+    assert response.json()["model"] == "gpt-5"
+
+
+def test_explain_provider_deterministic_overrides_ollama_triage() -> None:
+    client = TestClient(
+        create_app(
+            env={
+                "TRIAGE_PROVIDER": "ollama",
+                "EXPLAIN_PROVIDER": "deterministic",
+                "OLLAMA_MODEL": "qwen3-test",
+            },
+            ollama_client=FakeOllamaClient(valid_explanation_payload()),
+        )
+    )
+
+    response = client.post("/explain", json=validation_failure_snapshot())
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "deterministic"
+    assert response.json()["analysis_mode"] == "deterministic_runbook"
+
+
+def test_missing_explain_provider_falls_back_to_triage_provider() -> None:
+    fake = FakeOllamaClient(valid_explanation_payload())
+    client = TestClient(
+        create_app(
+            env={
+                "TRIAGE_PROVIDER": "ollama",
+                "OLLAMA_MODEL": "qwen3-test",
+            },
+            ollama_client=fake,
+        )
+    )
+
+    response = client.post("/explain", json=validation_failure_snapshot())
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "ollama"
+    assert response.json()["model"] == "qwen3-test"
+
+
+def test_invalid_explain_provider_is_rejected() -> None:
+    with pytest.raises(ValueError, match="EXPLAIN_PROVIDER must be deterministic, openai, or ollama"):
+        create_app(env={"TRIAGE_PROVIDER": "deterministic", "EXPLAIN_PROVIDER": "mystery"})
 
 
 def healthy_snapshot() -> dict[str, object]:
@@ -626,6 +744,19 @@ def snapshot_case(case: str) -> dict[str, object]:
     raise AssertionError(f"unknown snapshot case: {case}")
 
 
+def triage_body() -> dict[str, object]:
+    return {
+        "event_type": "webhook",
+        "business_event_type": "invoice.paid",
+        "source": "Payment Service",
+        "destination": "Receipt Service",
+        "http_status": 400,
+        "error": "Required field invoice_id was missing",
+        "attempt_count": 1,
+        "schema_version": "1",
+    }
+
+
 def valid_explanation_payload(
     *,
     headline: str = "Receipt delivery requires operator attention",
@@ -702,6 +833,7 @@ def evidence_text(explanation: object) -> list[str]:
 def openai_env() -> dict[str, str]:
     return {
         "TRIAGE_PROVIDER": "openai",
+        "EXPLAIN_PROVIDER": "openai",
         "OPENAI_API_KEY": SECRET_KEY,
         "OPENAI_MODEL": "gpt-5-test",
         "OPENAI_TIMEOUT_SECONDS": "7",

@@ -193,8 +193,8 @@ function providerLabel(provider: EventExplanation["provider"]): string {
 }
 
 function modelLabel(model: string): string {
-  if (model.toLowerCase() === "qwen3:4b") {
-    return "Qwen3 4B";
+  if (model.toLowerCase() === "gpt-5.4-mini") {
+    return "GPT-5.4 Mini";
   }
   return model;
 }

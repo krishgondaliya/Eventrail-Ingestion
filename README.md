@@ -35,13 +35,22 @@ docker pull ghcr.io/krishgondaliya/eventrail:latest
 ## Local demo
 
 ```powershell
-.\scripts\demo.ps1 start
+.\scripts\demo.ps1 start -NoBrowser
 .\scripts\demo.ps1 status
 .\scripts\demo.ps1 reset -Force
 .\scripts\demo.ps1 stop
 ```
 
 Use reset before interview practice to remove previous local events and start from a fresh environment.
+
+For the OpenAI Event Intelligence demo:
+
+```powershell
+$env:OPENAI_API_KEY = "<your API key>"
+.\scripts\demo.ps1 start -UseOpenAI -NoBrowser
+```
+
+Exception Guidance remains deterministic. Event Intelligence uses OpenAI only when `-UseOpenAI` is selected, and OpenAI failures fall back to deterministic grounded explanations. AI is outside the event-delivery correctness path.
 
 ---
 

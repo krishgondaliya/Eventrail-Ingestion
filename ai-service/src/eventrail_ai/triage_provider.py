@@ -281,7 +281,10 @@ def create_explainer_engine_from_environment(
 ) -> ExplainerEngine:
     if env is None:
         env = os.environ
-    provider_name = env.get("TRIAGE_PROVIDER", "deterministic").strip().lower() or "deterministic"
+    provider_value = env.get("EXPLAIN_PROVIDER")
+    if provider_value is None or not provider_value.strip():
+        provider_value = env.get("TRIAGE_PROVIDER", "deterministic")
+    provider_name = provider_value.strip().lower() or "deterministic"
     if provider_name == "deterministic":
         return ExplainerEngine(provider=DeterministicExplanationProvider())
     if provider_name == "ollama":
@@ -305,11 +308,11 @@ def create_explainer_engine_from_environment(
             fallback_provider=DeterministicExplanationProvider(),
         )
     if provider_name != "openai":
-        raise ValueError("TRIAGE_PROVIDER must be deterministic, openai, or ollama")
+        raise ValueError("EXPLAIN_PROVIDER must be deterministic, openai, or ollama")
 
     api_key = env.get("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("OPENAI_API_KEY is required when TRIAGE_PROVIDER=openai")
+        raise ValueError("OPENAI_API_KEY is required when EXPLAIN_PROVIDER=openai")
     model = env.get("OPENAI_MODEL", "gpt-5").strip() or "gpt-5"
     timeout_seconds = _positive_float(env.get("OPENAI_TIMEOUT_SECONDS", "7"), "OPENAI_TIMEOUT_SECONDS")
     provider = OpenAIExplanationProvider(

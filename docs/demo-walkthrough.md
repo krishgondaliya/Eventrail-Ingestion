@@ -9,6 +9,14 @@ Commands:
 .\scripts\demo.ps1 status
 ```
 
+For the OpenAI Event Intelligence version of the demo:
+
+```powershell
+$env:OPENAI_API_KEY = "<your API key>"
+.\scripts\demo.ps1 reset -Force -UseOpenAI -NoBrowser
+.\scripts\demo.ps1 status
+```
+
 Checklist:
 
 - All expected services are healthy.
@@ -17,7 +25,7 @@ Checklist:
 - Scenario buttons work.
 - Validation-failure and recovery controls are available.
 - Deterministic runbook analysis is the default.
-- Ollama is optional and not required for the demo.
+- OpenAI Event Intelligence is optional and enabled only with `-UseOpenAI`.
 
 ## 0:00-0:45 - Customer problem
 
@@ -95,11 +103,11 @@ For deterministic mode:
 
 This is deterministic runbook guidance.
 
-For Ollama success:
+For OpenAI Event Intelligence:
 
-This is locally generated guidance grounded in trusted runbooks.
+This is generated explanatory prose grounded in trusted runbooks and sanitized EventRail facts.
 
-Do not claim a live LLM was used unless the dashboard displays Local LLM grounded analysis.
+Do not claim a live LLM was used unless the dashboard displays LLM grounded analysis with Provider: OpenAI.
 
 ## 5:15-6:30 - Human-controlled recovery
 
@@ -175,18 +183,22 @@ The event remains durable and redrivable even when automated analysis is unavail
 
 Show that Fix destination and Redrive still work.
 
-### Ollama is slow
+### OpenAI Event Intelligence is unavailable
 
-Do not wait for it during the interview.
+Continue the demo.
 
-Restart with deterministic mode:
+Say:
+
+OpenAI is advisory and outside the event-delivery path. EventRail falls back to deterministic grounded explanations when the provider is unavailable.
+
+Restart with deterministic mode if needed:
 
 ```powershell
 .\scripts\demo.ps1 stop
 .\scripts\demo.ps1 start -NoBrowser
 ```
 
-Explain that the local model provider is optional and deterministic grounded guidance is the reliable fallback.
+Do not expose or log the API key.
 
 ### Stale data
 
@@ -214,7 +226,7 @@ Safe claims:
 - Retry and DLQ recovery
 - Human-controlled redrive
 - Sanitized runbook-grounded guidance
-- Optional local LLM provider
+- Optional OpenAI Event Intelligence
 - Deterministic fallback
 - AI outage does not affect event recovery
 
@@ -225,4 +237,4 @@ Claims to avoid:
 - Guaranteed prevention of all duplicate delivery attempts
 - Production-scale multi-region architecture
 - Live LLM use when deterministic mode is displayed
-- Ollama latency being suitable for every machine
+- AI-generated recovery actions changing EventRail state
