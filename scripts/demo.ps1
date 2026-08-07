@@ -1,11 +1,12 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("start", "status", "stop")]
+    [ValidateSet("start", "status", "stop", "reset")]
     [string]$Command = "status",
 
     [switch]$NoBrowser,
     [switch]$UseOllama,
-    [switch]$SkipAI
+    [switch]$SkipAI,
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -15,6 +16,8 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Paths = Get-DemoPaths -Root $Root
 
 function Start-Demo {
+    param([switch]$Fresh)
+
     if ($UseOllama -and $SkipAI) {
         throw "Use either -UseOllama or -SkipAI, not both."
     }
@@ -150,7 +153,7 @@ function Start-Demo {
         Write-Host "[6/6] Dashboard ready"
 
         Write-ProcessState -ProcessFile $paths.ProcessFile -State $state
-        Show-StartSummary -Paths $paths
+        Show-StartSummary -Paths $paths -Fresh:$Fresh
 
         if (-not $NoBrowser) {
             Start-Process "http://127.0.0.1:5173"
@@ -225,11 +228,18 @@ function Test-DemoPortsInUse {
 }
 
 function Show-StartSummary {
-    param([object]$Paths)
+    param(
+        [object]$Paths,
+        [switch]$Fresh
+    )
 
     $aiMode = if ($SkipAI) { "Skipped" } elseif ($UseOllama) { "Local Ollama" } else { "Deterministic" }
     Write-Host ""
-    Write-Host "EventRail demo is ready."
+    if ($Fresh) {
+        Write-Host "Fresh EventRail demo is ready."
+    } else {
+        Write-Host "EventRail demo is ready."
+    }
     Write-Host ""
     Write-Host "Dashboard:"
     Write-Host "http://127.0.0.1:5173"
@@ -295,20 +305,7 @@ function Show-Status {
 
 function Stop-Demo {
     $paths = Get-DemoPaths -Root $Root
-    $state = Read-ProcessState -ProcessFile $paths.ProcessFile
-
-    if ($null -eq $state) {
-        Write-Host "No recorded EventRail demo processes found."
-    } else {
-        foreach ($key in @("dashboard", "eventrail_api", "ai_service", "mock_destination")) {
-            $entry = Get-ObjectProperty -Object $state.processes -Name $key
-            if ($null -eq $entry -or (Get-ObjectProperty -Object $entry -Name "skipped") -eq $true) {
-                continue
-            }
-            Stop-ProcessTree -ProcessId ([int](Get-ObjectProperty -Object $entry -Name "pid"))
-            Write-Host "Stopped $key"
-        }
-    }
+    Stop-RecordedProcesses -Paths $paths
 
     Push-Location $Root
     try {
@@ -326,11 +323,64 @@ function Stop-Demo {
     Write-Host "EventRail demo stopped. Logs preserved at $($paths.LogDir)"
 }
 
+function Stop-RecordedProcesses {
+    param([object]$Paths)
+
+    $state = Read-ProcessState -ProcessFile $Paths.ProcessFile
+
+    if ($null -eq $state) {
+        Write-Host "No recorded EventRail demo processes found."
+        return
+    }
+
+    foreach ($key in @("dashboard", "eventrail_api", "ai_service", "mock_destination")) {
+        $entry = Get-ObjectProperty -Object $state.processes -Name $key
+        if ($null -eq $entry -or (Get-ObjectProperty -Object $entry -Name "skipped") -eq $true) {
+            continue
+        }
+        Stop-ProcessTree -ProcessId ([int](Get-ObjectProperty -Object $entry -Name "pid"))
+        Write-Host "Stopped $key"
+    }
+}
+
+function Reset-Demo {
+    if (-not $Force) {
+        Write-Host "Reset deletes local EventRail PostgreSQL and Redis demo data."
+        Write-Host "Run again with -Force to continue."
+        exit 1
+    }
+
+    $paths = Ensure-DemoDirectories -Root $Root
+    Stop-RecordedProcesses -Paths $paths
+
+    Push-Location $Root
+    try {
+        docker compose down -v | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Docker Compose reset failed."
+        }
+    } finally {
+        Pop-Location
+    }
+
+    if (Test-Path -LiteralPath $paths.ProcessFile) {
+        Remove-Item -LiteralPath $paths.ProcessFile -Force
+    }
+    if (Test-Path -LiteralPath $paths.LogDir) {
+        Get-ChildItem -LiteralPath $paths.LogDir -File | Remove-Item -Force
+    }
+    New-Item -ItemType Directory -Force -Path $paths.LogDir | Out-Null
+
+    Start-Demo -Fresh
+    Show-Status
+}
+
 try {
     switch ($Command) {
         "start" { Start-Demo }
         "status" { Show-Status }
         "stop" { Stop-Demo }
+        "reset" { Reset-Demo }
     }
 } catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
