@@ -44,6 +44,8 @@ func TestExplainRequestFromStoreConstructsAuthoritativeSnapshots(t *testing.T) {
 		dlq           operations.DLQDetail
 		dlqErr        error
 		wantCurrent   string
+		wantNumbers   []int
+		wantStatuses  []*int
 		wantOutcomes  []string
 		wantRetry     int
 		wantDLQ       bool
@@ -63,6 +65,8 @@ func TestExplainRequestFromStoreConstructsAuthoritativeSnapshots(t *testing.T) {
 			}),
 			dlqErr:        operations.ErrDLQNotFound,
 			wantCurrent:   operations.StatusDelivered,
+			wantNumbers:   []int{1},
+			wantStatuses:  []*int{intPtr(200)},
 			wantOutcomes:  []string{"success"},
 			wantRetry:     0,
 			wantDLQ:       false,
@@ -83,6 +87,8 @@ func TestExplainRequestFromStoreConstructsAuthoritativeSnapshots(t *testing.T) {
 			}),
 			dlqErr:        operations.ErrDLQNotFound,
 			wantCurrent:   operations.StatusDelivered,
+			wantNumbers:   []int{1, 2},
+			wantStatuses:  []*int{intPtr(503), intPtr(200)},
 			wantOutcomes:  []string{"temporary_failure", "success"},
 			wantRetry:     1,
 			wantDLQ:       false,
@@ -100,6 +106,8 @@ func TestExplainRequestFromStoreConstructsAuthoritativeSnapshots(t *testing.T) {
 			}),
 			dlq:           dlqFixture(nil),
 			wantCurrent:   operations.StatusDeadLettered,
+			wantNumbers:   []int{1},
+			wantStatuses:  []*int{intPtr(400)},
 			wantOutcomes:  []string{"permanent_failure"},
 			wantRetry:     0,
 			wantDLQ:       true,
@@ -116,10 +124,12 @@ func TestExplainRequestFromStoreConstructsAuthoritativeSnapshots(t *testing.T) {
 				historyAt(operations.StatusDelivered, base.Add(4*time.Second), nil),
 			}, []operations.DeliveryAttempt{
 				attemptAt(1, operations.DeliveryOutcomeFailed, intPtr(400), stringPtr("permanent delivery failure status=400"), base.Add(time.Second)),
-				attemptAt(2, operations.DeliveryOutcomeSucceeded, intPtr(200), nil, base.Add(4*time.Second)),
+				attemptAt(1, operations.DeliveryOutcomeSucceeded, intPtr(200), nil, base.Add(4*time.Second)),
 			}),
 			dlq:           dlqFixture(timePtr(base.Add(2 * time.Second))),
 			wantCurrent:   operations.StatusDelivered,
+			wantNumbers:   []int{1, 2},
+			wantStatuses:  []*int{intPtr(400), intPtr(200)},
 			wantOutcomes:  []string{"permanent_failure", "success"},
 			wantRetry:     0,
 			wantDLQ:       true,
@@ -138,6 +148,8 @@ func TestExplainRequestFromStoreConstructsAuthoritativeSnapshots(t *testing.T) {
 			}),
 			dlq:           dlqFixture(timePtr(base.Add(2 * time.Second))),
 			wantCurrent:   operations.StatusProcessing,
+			wantNumbers:   []int{1},
+			wantStatuses:  []*int{intPtr(400)},
 			wantOutcomes:  []string{"permanent_failure"},
 			wantRetry:     0,
 			wantDLQ:       true,
@@ -170,9 +182,63 @@ func TestExplainRequestFromStoreConstructsAuthoritativeSnapshots(t *testing.T) {
 			if len(got.StatusHistory) != len(tt.status.History) {
 				t.Fatalf("expected %d history entries, got %d", len(tt.status.History), len(got.StatusHistory))
 			}
-			assertAttemptOutcomes(t, got.DeliveryAttempts, tt.wantOutcomes)
+			assertAttemptFacts(t, got.DeliveryAttempts, tt.wantNumbers, tt.wantStatuses, tt.wantOutcomes)
 		})
 	}
+}
+
+func TestExplainRequestRenumbersMultipleRetriesAndRedriveChronologically(t *testing.T) {
+	base := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	store := &fakeOperationalStore{
+		eventStatus: eventStatusFixture([]operations.StatusHistoryEntry{
+			historyAt(operations.StatusStored, base, nil),
+			historyAt(operations.StatusRetrying, base.Add(time.Second), map[string]any{"next_retry": 1}),
+			historyAt(operations.StatusRetrying, base.Add(2*time.Second), map[string]any{"next_retry": 2}),
+			historyAt(operations.StatusDeadLettered, base.Add(3*time.Second), nil),
+			historyAt(operations.StatusRedriven, base.Add(4*time.Second), nil),
+			historyAt(operations.StatusDelivered, base.Add(5*time.Second), nil),
+		}, []operations.DeliveryAttempt{
+			attemptAt(1, operations.DeliveryOutcomeFailed, intPtr(500), stringPtr("retryable delivery failure status=500"), base.Add(time.Second)),
+			attemptAt(2, operations.DeliveryOutcomeFailed, intPtr(500), stringPtr("retryable delivery failure status=500"), base.Add(2*time.Second)),
+			attemptAt(1, operations.DeliveryOutcomeSucceeded, intPtr(200), nil, base.Add(5*time.Second)),
+		}),
+		dlqDetail: dlqFixture(timePtr(base.Add(4 * time.Second))),
+	}
+
+	got, err := explainRequestFromStore(context.Background(), store, explainEventID)
+	if err != nil {
+		t.Fatalf("explainRequestFromStore returned error: %v", err)
+	}
+
+	assertAttemptFacts(
+		t,
+		got.DeliveryAttempts,
+		[]int{1, 2, 3},
+		[]*int{intPtr(500), intPtr(500), intPtr(200)},
+		[]string{"temporary_failure", "temporary_failure", "success"},
+	)
+	if got.RetryCount != 2 {
+		t.Fatalf("expected retry count 2 from retry history, got %d", got.RetryCount)
+	}
+	if got.RedriveCount != 1 || !got.EnteredDLQ || !got.Delivered {
+		t.Fatalf("unexpected recovery facts: %#v", got)
+	}
+}
+
+func TestExplainDeliveryAttemptsPreservesStableInputOrderForEqualTimestamps(t *testing.T) {
+	at := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	attempts := explainDeliveryAttemptsFromStore([]operations.DeliveryAttempt{
+		attemptAt(7, operations.DeliveryOutcomeFailed, intPtr(503), nil, at),
+		attemptAt(1, operations.DeliveryOutcomeSucceeded, intPtr(200), nil, at),
+	})
+
+	assertAttemptFacts(
+		t,
+		attempts,
+		[]int{1, 2},
+		[]*int{intPtr(503), intPtr(200)},
+		[]string{"temporary_failure", "success"},
+	)
 }
 
 func TestExplainRequestBoundsHistoryPreservingImportantTransitions(t *testing.T) {
@@ -557,16 +623,29 @@ func attemptAt(number int, outcome string, responseCode *int, message *string, c
 	}
 }
 
-func assertAttemptOutcomes(t *testing.T, attempts []explainDeliveryAttempt, want []string) {
+func assertAttemptFacts(t *testing.T, attempts []explainDeliveryAttempt, wantNumbers []int, wantStatuses []*int, wantOutcomes []string) {
 	t.Helper()
-	if len(attempts) != len(want) {
-		t.Fatalf("expected %d attempts, got %d", len(want), len(attempts))
+	if len(attempts) != len(wantOutcomes) || len(attempts) != len(wantNumbers) || len(attempts) != len(wantStatuses) {
+		t.Fatalf("unexpected attempt lengths: got=%d numbers=%d statuses=%d outcomes=%d", len(attempts), len(wantNumbers), len(wantStatuses), len(wantOutcomes))
 	}
-	for i, outcome := range want {
-		if attempts[i].Outcome != outcome {
-			t.Fatalf("attempt %d expected outcome %q, got %q", i, outcome, attempts[i].Outcome)
+	for i := range attempts {
+		if attempts[i].AttemptNumber != wantNumbers[i] {
+			t.Fatalf("attempt index %d expected snapshot number %d, got %d", i, wantNumbers[i], attempts[i].AttemptNumber)
+		}
+		if !sameOptionalInt(attempts[i].HTTPStatus, wantStatuses[i]) {
+			t.Fatalf("attempt index %d expected HTTP status %#v, got %#v", i, wantStatuses[i], attempts[i].HTTPStatus)
+		}
+		if attempts[i].Outcome != wantOutcomes[i] {
+			t.Fatalf("attempt index %d expected outcome %q, got %q", i, wantOutcomes[i], attempts[i].Outcome)
 		}
 	}
+}
+
+func sameOptionalInt(left *int, right *int) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
 }
 
 func explainHistoryContains(history []explainStatusHistory, status string) bool {

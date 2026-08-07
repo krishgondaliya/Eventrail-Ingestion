@@ -154,9 +154,12 @@ func explainStatusHistoryFromStore(history []operations.StatusHistoryEntry) []ex
 
 func explainDeliveryAttemptsFromStore(attempts []operations.DeliveryAttempt) []explainDeliveryAttempt {
 	items := make([]explainDeliveryAttempt, 0, len(attempts))
-	for _, attempt := range attempts {
+	for index, attempt := range attempts {
 		items = append(items, explainDeliveryAttempt{
-			AttemptNumber: attempt.AttemptNumber,
+			// Stored attempt numbers are worker-local and can reset after redrive.
+			// The Event Intelligence snapshot uses the chronological ordinal for
+			// the complete event lifecycle while preserving stored attempt facts.
+			AttemptNumber: index + 1,
 			HTTPStatus:    attempt.ResponseCode,
 			Outcome:       explainAttemptOutcome(attempt),
 			Error:         safeExplainError(attempt),
