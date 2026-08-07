@@ -140,7 +140,7 @@ function Start-Demo {
         Wait-Until -Name "EventRail API" -Check { Test-HttpHealthy -Url "http://127.0.0.1:8080/health/ready" }
         Write-Host "[5/6] EventRail API ready"
 
-        $dashboardCommand = "`$env:VITE_EVENTRAIL_API_URL='http://127.0.0.1:8080'; `$env:VITE_MOCK_DESTINATION_URL='http://127.0.0.1:8081'; npm run dev -- --host 127.0.0.1"
+        $dashboardCommand = "`$env:VITE_EVENTRAIL_API_URL='http://127.0.0.1:8080'; `$env:VITE_MOCK_DESTINATION_URL='http://127.0.0.1:8081'; & '.\node_modules\.bin\vite.cmd' --host 127.0.0.1"
         $dashboard = Start-AppProcess `
             -Name "dashboard" `
             -Command $dashboardCommand `

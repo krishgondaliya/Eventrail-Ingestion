@@ -38,7 +38,24 @@ export function EventSummary({ scenario }: EventSummaryProps) {
         </div>
         <div>
           <dt>Event ID</dt>
-          <dd className="event-id">{scenario.event.eventId}</dd>
+          <dd className="event-id">
+            {scenario.event.eventId}
+            {scenario.event.eventId !== "Not submitted yet" ? (
+              <button
+                className="copy-button"
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(scenario.event.eventId);
+                }}
+              >
+                Copy
+              </button>
+            ) : null}
+          </dd>
+        </div>
+        <div>
+          <dt>Created</dt>
+          <dd>{scenario.event.createdAt}</dd>
         </div>
       </dl>
     </section>

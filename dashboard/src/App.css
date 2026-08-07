@@ -145,6 +145,136 @@ h4 {
   box-shadow: 0 14px 34px rgba(24, 35, 52, 0.07);
 }
 
+.run-panel {
+  align-items: flex-start;
+}
+
+.transaction-copy {
+  flex: 0.82 1 260px;
+}
+
+.transaction-form {
+  display: grid;
+  flex: 1.25 1 520px;
+  grid-template-columns: 1fr 0.72fr 0.56fr;
+  gap: 12px;
+}
+
+.transaction-form label,
+.transaction-form fieldset {
+  min-width: 0;
+}
+
+.transaction-form label {
+  display: grid;
+  gap: 6px;
+  color: #435168;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.transaction-form input,
+.transaction-form select {
+  min-height: 42px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #cbd6e2;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #172033;
+  font: inherit;
+  font-size: 0.95rem;
+  font-weight: 700;
+  text-transform: none;
+}
+
+.transaction-form input:focus,
+.transaction-form select:focus {
+  outline: 3px solid rgba(47, 111, 237, 0.22);
+  border-color: #2f6fed;
+}
+
+.read-only-fields {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.read-only-fields span {
+  padding: 11px 12px;
+  border: 1px solid #dfe7ef;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #46566d;
+  font-weight: 800;
+}
+
+.transaction-form fieldset {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.transaction-form .run-actions {
+  grid-column: 1 / -1;
+}
+
+.transaction-form legend {
+  margin-bottom: 8px;
+  color: #435168;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.behavior-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.behavior-option {
+  position: relative;
+  display: grid !important;
+  grid-template-columns: 18px 1fr;
+  align-items: start;
+  gap: 9px !important;
+  min-height: 88px;
+  padding: 12px;
+  border: 1px solid #dfe7ef;
+  border-radius: 8px;
+  background: #fbfcfd;
+  cursor: pointer;
+  text-transform: none !important;
+}
+
+.behavior-option input {
+  width: 16px;
+  min-height: 16px;
+  margin-top: 2px;
+  accent-color: #2f6fed;
+}
+
+.behavior-option strong,
+.behavior-option small {
+  display: block;
+}
+
+.behavior-option strong {
+  color: #172033;
+  font-size: 0.9rem;
+}
+
+.behavior-option small {
+  margin-top: 4px;
+  color: #607084;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
 .connection-panel p,
 .run-panel p {
   margin-bottom: 0;
@@ -432,7 +562,7 @@ h4 {
 
 .summary-details {
   display: grid;
-  grid-template-columns: 1.25fr 0.8fr 0.72fr 1.35fr;
+  grid-template-columns: 1.25fr 0.8fr 0.72fr 1.35fr 0.8fr;
   gap: 16px;
   margin: 22px 0 0;
 }
@@ -458,11 +588,75 @@ dd {
 }
 
 .event-id {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
   overflow-wrap: anywhere;
   color: #46566d;
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 0.86rem;
   font-weight: 600;
+}
+
+.copy-button {
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid #cbd6e2;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #344154;
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.technical-panel {
+  margin-top: 18px;
+  padding: 18px 20px;
+  border: 1px solid #dbe2ea;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 14px 34px rgba(24, 35, 52, 0.07);
+}
+
+.technical-panel summary {
+  cursor: pointer;
+  color: #344154;
+  font-weight: 900;
+}
+
+.technical-panel dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 16px 0 0;
+}
+
+.technical-panel div {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #dfe7ef;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.technical-panel ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.technical-panel li {
+  padding: 7px 9px;
+  border-radius: 999px;
+  background: #eef3f7;
+  color: #46566d;
+  font-size: 0.82rem;
+  font-weight: 800;
 }
 
 .technical-value {
@@ -929,7 +1123,8 @@ code {
 
 @media (max-width: 920px) {
   .metrics-grid,
-  .summary-details {
+  .summary-details,
+  .technical-panel dl {
     grid-template-columns: 1fr 1fr;
   }
 
@@ -940,7 +1135,8 @@ code {
   }
 
   .demo-progress,
-  .outcome-facts {
+  .outcome-facts,
+  .behavior-options {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -962,7 +1158,11 @@ code {
   }
 
   .metrics-grid,
-  .summary-details {
+  .summary-details,
+  .technical-panel dl,
+  .transaction-form,
+  .read-only-fields,
+  .behavior-options {
     grid-template-columns: 1fr;
   }
 

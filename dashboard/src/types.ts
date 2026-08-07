@@ -13,6 +13,8 @@ export type ScenarioKey = "healthy" | "temporary" | "validation" | "recovered";
 
 export type DemoMode = "live" | "fixture";
 
+export type ReceiptBehavior = "healthy" | "temporary" | "validation";
+
 export type LiveWorkflowState =
   | "idle"
   | "configuring_destination"
@@ -45,6 +47,14 @@ export interface BusinessEvent {
   source: string;
   destination: string;
   eventId: string;
+  createdAt: string;
+}
+
+export interface LiveTransactionForm {
+  invoiceID: string;
+  amount: string;
+  currency: "USD" | "CAD" | "EUR";
+  behavior: ReceiptBehavior;
 }
 
 export interface TimelineStep {
@@ -104,4 +114,18 @@ export interface ToastMessage {
   key: string;
   message: string;
   tone: "neutral" | "success" | "warning" | "danger";
+}
+
+export interface TechnicalDetails {
+  eventId: string;
+  eventRailType: string;
+  businessEventType: string;
+  source: string;
+  destination: string;
+  currentStatus: string;
+  attemptCount: number;
+  analysisMode?: string;
+  provider?: string;
+  model?: string | null;
+  metadata: string[];
 }

@@ -10,6 +10,7 @@ const event: BusinessEvent = {
   source: "Payment Service",
   destination: "Receipt Service",
   eventId: "6f1f4f9e-7f48-4c1d-8bcb-91d31a0b2048",
+  createdAt: "Fixture timestamp",
 };
 
 const importantDescriptions = {

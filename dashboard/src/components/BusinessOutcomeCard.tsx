@@ -81,31 +81,39 @@ function outcomeCopy(
   }
   if (isRecovered(scenario)) {
     return {
-      title: "Delivery recovered successfully",
+      title: mode === "live" ? "Operator recovery completed" : "Delivery recovered successfully",
       body:
-        "The operator corrected the issue and redrove the original event without asking the customer to repay.",
+        mode === "live"
+          ? "The original EventRail event was redriven and the receipt was delivered without asking the customer to submit the payment again."
+          : "The operator corrected the issue and redrove the original event without asking the customer to repay.",
       tone: "success",
     };
   }
   if (scenario.summaryStatus === "DELIVERED") {
     if (scenario.timeline.some((step) => step.id === "RETRYING" && step.state === "complete")) {
       return {
-        title: "Customer action not required",
+        title: mode === "live" ? "Recovered automatically" : "Customer action not required",
         body:
           "EventRail recovered automatically. The customer did not need to submit the payment again.",
         tone: "success",
       };
     }
     return {
-      title: "Receipt delivery completed",
-      body: "The Receipt Service received the event successfully.",
+      title: mode === "live" ? "Receipt delivered successfully" : "Receipt delivery completed",
+      body:
+        mode === "live"
+          ? `Invoice ${scenario.event.invoiceNumber} was delivered to the Receipt Service on the first attempt.`
+          : "The Receipt Service received the event successfully.",
       tone: "success",
     };
   }
   if (scenario.summaryStatus === "DEAD_LETTERED") {
     return {
       title: "Payment event remains protected",
-      body: "Delivery stopped safely. The event is stored and available for operator recovery.",
+      body:
+        mode === "live"
+          ? `Delivery stopped safely. Invoice ${scenario.event.invoiceNumber} remains stored and available for operator recovery.`
+          : "Delivery stopped safely. The event is stored and available for operator recovery.",
       tone: "danger",
     };
   }

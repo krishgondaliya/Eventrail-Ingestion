@@ -12,6 +12,7 @@ import { EventTimeline } from "./components/EventTimeline";
 import { GuidedDemoBanner } from "./components/GuidedDemoBanner";
 import { Header } from "./components/Header";
 import { MetricsOverview } from "./components/MetricsOverview";
+import { TechnicalDetails } from "./components/TechnicalDetails";
 import { ToastRegion } from "./components/ToastRegion";
 import { demoScenarios } from "./demoScenarios";
 import { useEventDemo } from "./hooks/useEventDemo";
@@ -35,11 +36,14 @@ function App() {
         workflowState={demo.workflowState}
         backendAvailable={demo.backendAvailable}
         eventID={demo.eventID}
+        transaction={demo.transaction}
         isRunActive={demo.isRunActive}
         canRecover={demo.canRecover}
         canRedrive={demo.canRedrive}
         errorMessage={demo.errorMessage}
+        onUpdateTransaction={demo.updateTransaction}
         onRunDemo={demo.runDemo}
+        onStartNewEvent={demo.startNewEvent}
         onFixDestination={demo.fixDestination}
         onRedriveEvent={demo.redriveEvent}
       />
@@ -55,6 +59,7 @@ function App() {
       />
       <MetricsOverview metrics={demo.scenario.metrics} />
       <EventSummary scenario={demo.scenario} />
+      <TechnicalDetails details={demo.technicalDetails} />
       <EventTimeline steps={demo.scenario.timeline} />
       <section className="insight-grid" aria-label="Delivery details and AI guidance">
         <AttemptHistory attempts={demo.scenario.attempts} />
@@ -62,12 +67,14 @@ function App() {
       </section>
       <ActivityFeed activity={demo.activity} />
       <ToastRegion toasts={demo.toasts} />
-      <DemoControls
-        scenarios={demoScenarios}
-        selectedKey={selectedKey}
-        disabled={demo.isRunActive}
-        onSelect={setSelectedKey}
-      />
+      {demo.mode === "fixture" ? (
+        <DemoControls
+          scenarios={demoScenarios}
+          selectedKey={selectedKey}
+          disabled={demo.isRunActive}
+          onSelect={setSelectedKey}
+        />
+      ) : null}
     </main>
   );
 }
