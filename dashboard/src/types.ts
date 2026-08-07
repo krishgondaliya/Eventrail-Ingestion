@@ -13,6 +13,8 @@ export type ScenarioKey = "healthy" | "temporary" | "validation" | "recovered";
 
 export type DemoMode = "live" | "fixture";
 
+export type ReceiptBehavior = "healthy" | "temporary" | "validation";
+
 export type LiveWorkflowState =
   | "idle"
   | "configuring_destination"
@@ -20,12 +22,14 @@ export type LiveWorkflowState =
   | "tracking"
   | "retrying"
   | "needs_attention"
+  | "triage_loading"
+  | "triage_ready"
   | "fixing_destination"
   | "redriving"
   | "delivered"
   | "failed";
 
-export type TimelineState = "complete" | "current" | "future";
+export type TimelineState = "complete" | "current" | "future" | "skipped";
 
 export interface Metric {
   label: string;
@@ -43,6 +47,14 @@ export interface BusinessEvent {
   source: string;
   destination: string;
   eventId: string;
+  createdAt: string;
+}
+
+export interface LiveTransactionForm {
+  invoiceID: string;
+  amount: string;
+  currency: "USD" | "CAD" | "EUR";
+  behavior: ReceiptBehavior;
 }
 
 export interface TimelineStep {
@@ -77,6 +89,53 @@ export interface AITriage {
   };
 }
 
+export type ExplanationRecoveryStatus =
+  | "not_needed"
+  | "not_ready"
+  | "review_required"
+  | "completed";
+
+export type ExplanationAnalysisMode =
+  | "deterministic_runbook"
+  | "llm_grounded"
+  | "deterministic_fallback";
+
+export type ExplanationProvider = "deterministic" | "openai" | "ollama";
+
+export type ExplanationEvidenceType =
+  | "event_status"
+  | "delivery_attempt"
+  | "retry"
+  | "dlq"
+  | "redrive"
+  | "delivery_outcome";
+
+export interface EventExplanationEvidence {
+  type: ExplanationEvidenceType;
+  description: string;
+}
+
+export interface EventExplanationCitation {
+  runbook_id: string;
+  chunk_id: string;
+  title: string;
+  source_path: string;
+}
+
+export interface EventExplanation {
+  headline: string;
+  what_happened: string;
+  business_impact: string;
+  next_action: string;
+  recommended_actions: string[];
+  recovery_status: ExplanationRecoveryStatus;
+  evidence: EventExplanationEvidence[];
+  citations: EventExplanationCitation[];
+  analysis_mode: ExplanationAnalysisMode;
+  provider: ExplanationProvider;
+  model: string | null;
+}
+
 export interface DemoScenario {
   key: ScenarioKey;
   controlLabel: string;
@@ -93,4 +152,29 @@ export interface ActivityEntry {
   id: number;
   time: string;
   message: string;
+  detail?: string;
+  tone: "neutral" | "success" | "warning" | "danger" | "active";
+}
+
+export interface ToastMessage {
+  id: number;
+  key: string;
+  message: string;
+  tone: "neutral" | "success" | "warning" | "danger";
+}
+
+export interface TechnicalDetails {
+  eventId: string;
+  eventRailType: string;
+  businessEventType: string;
+  source: string;
+  destination: string;
+  currentStatus: string;
+  attemptCount: number;
+  analysisMode?: string;
+  provider?: string;
+  model?: string | null;
+  explanationRecoveryStatus?: string;
+  explanationCitationChunkIDs?: string[];
+  metadata: string[];
 }

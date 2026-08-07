@@ -16,9 +16,13 @@ export function ActivityFeed({ activity }: ActivityFeedProps) {
       ) : (
         <ol className="activity-list">
           {activity.map((entry) => (
-            <li key={entry.id}>
+            <li className={`activity-entry activity-${entry.tone}`} key={entry.id}>
+              <span className="activity-indicator" aria-hidden="true" />
               <time>{entry.time}</time>
-              <span>{entry.message}</span>
+              <span>
+                <strong>{entry.message}</strong>
+                {entry.detail ? <small>{entry.detail}</small> : null}
+              </span>
             </li>
           ))}
         </ol>

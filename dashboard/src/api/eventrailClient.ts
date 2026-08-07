@@ -1,4 +1,5 @@
 import { readJSON } from "./errors";
+import type { EventExplanation } from "../types";
 
 export interface CreateEventRequest {
   event_type: string;
@@ -138,6 +139,14 @@ export class EventRailClient {
       signal,
     });
     return readJSON<TriageResponse>(response);
+  }
+
+  async explainEvent(eventID: string, signal?: AbortSignal): Promise<EventExplanation> {
+    const response = await fetch(`${this.baseURL}/events/${eventID}/explain`, {
+      method: "POST",
+      signal,
+    });
+    return readJSON<EventExplanation>(response);
   }
 
   async getMetrics(signal?: AbortSignal): Promise<MetricsSummaryResponse> {

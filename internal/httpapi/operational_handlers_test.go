@@ -14,16 +14,19 @@ import (
 )
 
 type fakeOperationalStore struct {
-	eventStatus operations.EventStatus
-	eventErr    error
-	listStatus  string
-	listLimit   int
-	listRecords []operations.DLQRecord
-	dlqDetail   operations.DLQDetail
-	dlqErr      error
-	redrive     operations.RedriveResult
-	redriveErr  error
-	metrics     operations.MetricsSummary
+	eventStatus    operations.EventStatus
+	eventErr       error
+	eventStatusIDs []string
+	listStatus     string
+	listLimit      int
+	listRecords    []operations.DLQRecord
+	dlqDetail      operations.DLQDetail
+	dlqErr         error
+	dlqDetailIDs   []string
+	redrive        operations.RedriveResult
+	redriveErr     error
+	redriveCalls   int
+	metrics        operations.MetricsSummary
 }
 
 type fakeTriageClient struct {
@@ -50,7 +53,8 @@ func (c *fakeTriageClient) Triage(_ context.Context, request triageRequest) (tri
 	return c.response, nil
 }
 
-func (s *fakeOperationalStore) EventStatus(context.Context, string) (operations.EventStatus, error) {
+func (s *fakeOperationalStore) EventStatus(_ context.Context, eventID string) (operations.EventStatus, error) {
+	s.eventStatusIDs = append(s.eventStatusIDs, eventID)
 	return s.eventStatus, s.eventErr
 }
 
@@ -60,11 +64,13 @@ func (s *fakeOperationalStore) ListDLQ(ctx context.Context, status string, limit
 	return s.listRecords, nil
 }
 
-func (s *fakeOperationalStore) DLQDetail(context.Context, string) (operations.DLQDetail, error) {
+func (s *fakeOperationalStore) DLQDetail(_ context.Context, eventID string) (operations.DLQDetail, error) {
+	s.dlqDetailIDs = append(s.dlqDetailIDs, eventID)
 	return s.dlqDetail, s.dlqErr
 }
 
 func (s *fakeOperationalStore) RedriveDLQ(ctx context.Context, eventID string, publish operations.RedrivePublisher) (operations.RedriveResult, error) {
+	s.redriveCalls++
 	if s.redriveErr != nil {
 		return operations.RedriveResult{}, s.redriveErr
 	}

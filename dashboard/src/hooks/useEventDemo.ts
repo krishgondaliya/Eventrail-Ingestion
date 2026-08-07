@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { APIError } from "../api/errors";
 import {
   EventRailClient,
   type DeliveryAttemptResponse,
@@ -16,14 +17,20 @@ import { demoScenarios, timeline } from "../demoScenarios";
 import type {
   ActivityEntry,
   AITriage,
+  BusinessEvent,
   DeliveryAttempt,
   DemoMode,
   DemoScenario,
+  EventExplanation,
   InternalStatus,
+  LiveTransactionForm,
   LiveWorkflowState,
   Metric,
+  ReceiptBehavior,
   ScenarioKey,
+  TechnicalDetails,
   TimelineStep,
+  ToastMessage,
 } from "../types";
 
 const pollIntervalMs = 1000;
@@ -34,17 +41,33 @@ export interface EventDemoState {
   backendAvailable: boolean | null;
   connectionText: string;
   workflowState: LiveWorkflowState;
+  transaction: LiveTransactionForm;
   activity: ActivityEntry[];
+  toasts: ToastMessage[];
   eventID: string | null;
   mockStats: MockDestinationStats | null;
+  technicalDetails: TechnicalDetails | null;
+  explanation: EventExplanation | null;
+  explanationLoading: boolean;
+  explanationError: string | null;
+  explanationGeneratedFor: string | null;
+  explanationStale: boolean;
+  canExplainEvent: boolean;
   isRunActive: boolean;
   canRecover: boolean;
   canRedrive: boolean;
   errorMessage: string | null;
+  updateTransaction: <K extends keyof LiveTransactionForm>(
+    field: K,
+    value: LiveTransactionForm[K],
+  ) => void;
   runDemo: () => void;
+  startNewEvent: () => void;
   openFixturePreview: () => void;
   fixDestination: () => void;
   redriveEvent: () => void;
+  explainCurrentEvent: () => void;
+  clearExplanation: () => void;
   refreshConnection: () => void;
 }
 
@@ -54,50 +77,112 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
   const [mode, setMode] = useState<DemoMode>("live");
   const [backendAvailable, setBackendAvailable] = useState<boolean | null>(null);
   const [workflowState, setWorkflowState] = useState<LiveWorkflowState>("idle");
+  const [transaction, setTransaction] = useState<LiveTransactionForm>(() => newTransactionForm());
+  const [submittedEventID, setSubmittedEventID] = useState<string | null>(null);
   const [eventStatus, setEventStatus] = useState<EventStatusResponse | null>(null);
   const [dlqDetail, setDLQDetail] = useState<EventStatusResponse | null>(null);
   const [metrics, setMetrics] = useState<MetricsSummaryResponse | null>(null);
   const [mockStats, setMockStats] = useState<MockDestinationStats | null>(null);
   const [triage, setTriage] = useState<TriageResponse | null>(null);
   const [triageUnavailable, setTriageUnavailable] = useState(false);
+  const [explanation, setExplanation] = useState<EventExplanation | null>(null);
+  const [explanationLoading, setExplanationLoading] = useState(false);
+  const [explanationError, setExplanationError] = useState<string | null>(null);
+  const [explanationGeneratedFor, setExplanationGeneratedFor] = useState<string | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [fixedDestination, setFixedDestination] = useState(false);
   const activeRun = useRef<AbortController | null>(null);
+  const activeExplanation = useRef<AbortController | null>(null);
   const activityID = useRef(0);
+  const toastID = useRef(0);
+  const seenToastKeys = useRef(new Set<string>());
+  const toastTimers = useRef<number[]>([]);
 
   const fixtureScenario = useMemo(
     () => demoScenarios.find((scenario) => scenario.key === selectedKey) ?? demoScenarios[0],
     [selectedKey],
   );
 
-  const appendActivity = useCallback((message: string) => {
-    const entry = {
-      id: activityID.current,
-      time: new Date().toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }),
-      message,
-    };
-    activityID.current += 1;
-    setActivity((current) => [...current, entry]);
+  const appendActivity = useCallback(
+    (
+      message: string,
+      detail?: string,
+      tone: ActivityEntry["tone"] = "neutral",
+      time?: string,
+    ) => {
+      const entry = {
+        id: activityID.current,
+        time: time ?? currentTime(),
+        message,
+        detail,
+        tone,
+      };
+      activityID.current += 1;
+      setActivity((current) => [...current, entry]);
+    },
+    [],
+  );
+
+  const clearToasts = useCallback(() => {
+    for (const timer of toastTimers.current) {
+      window.clearTimeout(timer);
+    }
+    toastTimers.current = [];
+    seenToastKeys.current.clear();
+    setToasts([]);
   }, []);
+
+  const showToast = useCallback(
+    (key: string, message: string, tone: ToastMessage["tone"] = "neutral") => {
+      if (seenToastKeys.current.has(key)) {
+        return;
+      }
+      seenToastKeys.current.add(key);
+      const id = toastID.current;
+      toastID.current += 1;
+      setToasts((current) => [...current.slice(-2), { id, key, message, tone }]);
+      const timer = window.setTimeout(() => {
+        setToasts((current) => current.filter((toast) => toast.id !== id));
+      }, 4200);
+      toastTimers.current.push(timer);
+    },
+    [],
+  );
 
   const abortActiveRun = useCallback(() => {
     activeRun.current?.abort();
     activeRun.current = null;
   }, []);
 
+  const abortActiveExplanation = useCallback(() => {
+    activeExplanation.current?.abort();
+    activeExplanation.current = null;
+  }, []);
+
+  const clearExplanation = useCallback(() => {
+    abortActiveExplanation();
+    setExplanation(null);
+    setExplanationLoading(false);
+    setExplanationError(null);
+    setExplanationGeneratedFor(null);
+  }, [abortActiveExplanation]);
+
   const refreshMetrics = useCallback(
     async (signal?: AbortSignal) => {
-      const [summary, stats] = await Promise.all([
-        eventrail.getMetrics(signal),
-        destination.getStats(signal),
-      ]);
-      setMetrics(summary);
-      setMockStats(stats);
+      try {
+        const [summary, stats] = await Promise.all([
+          eventrail.getMetrics(signal),
+          destination.getStats(signal),
+        ]);
+        setMetrics(summary);
+        setMockStats(stats);
+      } catch {
+        if (!signal?.aborted) {
+          setErrorMessage("Metrics unavailable");
+        }
+      }
     },
     [destination, eventrail],
   );
@@ -109,49 +194,169 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
       .then(() => {
         setBackendAvailable(true);
         setErrorMessage(null);
+        void refreshMetrics(controller.signal);
       })
       .catch(() => {
         setBackendAvailable(false);
-        setErrorMessage("Backend unavailable");
+        setErrorMessage("Live EventRail is unavailable");
       });
     return () => controller.abort();
-  }, [eventrail]);
+  }, [eventrail, refreshMetrics]);
 
   useEffect(() => refreshConnection(), [refreshConnection]);
 
   useEffect(() => {
-    abortActiveRun();
-    setWorkflowState("idle");
-    setEventStatus(null);
-    setDLQDetail(null);
-    setMetrics(null);
-    setMockStats(null);
-    setTriage(null);
-    setTriageUnavailable(false);
-    setActivity([]);
-    setErrorMessage(null);
-    setFixedDestination(false);
-  }, [abortActiveRun, selectedKey]);
+    return () => {
+      abortActiveRun();
+      abortActiveExplanation();
+      clearToasts();
+    };
+  }, [abortActiveExplanation, abortActiveRun, clearToasts]);
 
-  useEffect(() => abortActiveRun, [abortActiveRun]);
+  const resetEventSpecificState = useCallback(
+    (nextTransaction?: LiveTransactionForm) => {
+      abortActiveRun();
+      setMode("live");
+      setWorkflowState("idle");
+      setSubmittedEventID(null);
+      setEventStatus(null);
+      setDLQDetail(null);
+      setTriage(null);
+      setTriageUnavailable(false);
+      clearExplanation();
+      setActivity([]);
+      clearToasts();
+      setErrorMessage(null);
+      setFixedDestination(false);
+      activityID.current = 0;
+      if (nextTransaction) {
+        setTransaction(nextTransaction);
+      }
+    },
+    [abortActiveRun, clearExplanation, clearToasts],
+  );
+
+  const updateTransaction = useCallback(
+    <K extends keyof LiveTransactionForm>(field: K, value: LiveTransactionForm[K]) => {
+      setTransaction((current) => ({ ...current, [field]: value }));
+    },
+    [],
+  );
+
+  const currentExplanationFingerprint = useMemo(
+    () => explanationFingerprint(submittedEventID, eventStatus, dlqDetail, fixedDestination),
+    [dlqDetail, eventStatus, fixedDestination, submittedEventID],
+  );
+  const canExplainEvent = mode === "live" && currentExplanationFingerprint !== null;
+  const explanationStale =
+    explanation !== null &&
+    explanationGeneratedFor !== null &&
+    currentExplanationFingerprint !== null &&
+    explanationGeneratedFor !== currentExplanationFingerprint;
+
+  const explainCurrentEvent = useCallback(() => {
+    const eventID = submittedEventID;
+    const fingerprint = currentExplanationFingerprint;
+    if (!eventID || !fingerprint) {
+      setExplanationError("More event history is needed before Event Intelligence can explain it.");
+      return;
+    }
+
+    abortActiveExplanation();
+    const controller = new AbortController();
+    const replacingStaleExplanation = explanation !== null && explanationStale;
+    activeExplanation.current = controller;
+    setExplanationLoading(true);
+    setExplanationError(null);
+
+    void eventrail
+      .explainEvent(eventID, controller.signal)
+      .then((response) => {
+        setExplanation(response);
+        setExplanationGeneratedFor(fingerprint);
+        setExplanationError(null);
+        appendOnce(
+          `${eventID}:${fingerprint}`,
+          replacingStaleExplanation ? "Event Intelligence refreshed" : "Event Intelligence ready",
+          appendActivity,
+          replacingStaleExplanation
+            ? "The explanation now includes the latest retry or recovery outcome."
+            : "A grounded explanation of the current delivery history is available.",
+          "active",
+        );
+        showToast(
+          replacingStaleExplanation
+            ? `event-explanation-updated:${eventID}:${fingerprint}`
+            : `event-explanation-ready:${eventID}:${fingerprint}`,
+          replacingStaleExplanation ? "Event explanation updated" : "Event explanation ready",
+          "neutral",
+        );
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setExplanationError(explainErrorMessage(error));
+        showToast(
+          `event-explanation-failed:${eventID}:${fingerprint}`,
+          "Event Intelligence unavailable",
+          "warning",
+        );
+      })
+      .finally(() => {
+        if (activeExplanation.current === controller) {
+          activeExplanation.current = null;
+        }
+        if (!controller.signal.aborted) {
+          setExplanationLoading(false);
+        }
+      });
+  }, [
+    abortActiveExplanation,
+    appendActivity,
+    currentExplanationFingerprint,
+    eventrail,
+    explanation,
+    explanationStale,
+    showToast,
+    submittedEventID,
+  ]);
 
   const pollStatus = useCallback(
     async (eventID: string, controller: AbortController) => {
       while (!controller.signal.aborted) {
         const status = await eventrail.getEventStatus(eventID, controller.signal);
         setEventStatus(status);
-        updateWorkflowFromStatus(status, setWorkflowState, appendActivity);
+        updateWorkflowFromStatus(status, setWorkflowState, appendActivity, showToast);
         await refreshMetrics(controller.signal);
 
         if (status.current_status === "DELIVERED") {
           setTriage(null);
           setTriageUnavailable(false);
-          appendActivity("Receipt successfully delivered");
+          appendOnce(
+            eventID,
+            "Receipt delivered",
+            appendActivity,
+            "The Receipt Service confirmed successful delivery.",
+            "success",
+            latestHistoryTime(status.history, "DELIVERED"),
+          );
+          showToast("delivered", "Receipt delivered", "success");
           activeRun.current = null;
           return;
         }
 
         if (status.current_status === "DEAD_LETTERED") {
+          setWorkflowState("triage_loading");
+          appendOnce(
+            eventID,
+            "Event moved to Needs attention",
+            appendActivity,
+            "Receipt Service rejected the delivery with a permanent failure.",
+            "danger",
+            latestHistoryTime(status.history, "DEAD_LETTERED"),
+          );
+          showToast("needs-attention", "Delivery requires attention", "danger");
           const dlq = await eventrail.getDLQDetail(eventID, controller.signal);
           setDLQDetail({
             event_id: dlq.record.event_id,
@@ -165,14 +370,27 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
             const triageResponse = await eventrail.triageDLQ(eventID, controller.signal);
             setTriage(triageResponse);
             setTriageUnavailable(false);
-            appendActivity("Grounded triage received from trusted runbooks");
+            setWorkflowState("triage_ready");
+            appendOnce(
+              eventID,
+              "Exception guidance returned",
+              appendActivity,
+              "Trusted runbook recommendations are available.",
+              "active",
+            );
+            showToast("triage-ready", "Grounded guidance ready", "neutral");
           } catch {
             setTriage(null);
             setTriageUnavailable(true);
-            appendActivity("Grounded triage unavailable; DLQ inspection remains available");
+            setWorkflowState("needs_attention");
+            appendOnce(
+              eventID,
+              "Automated analysis unavailable",
+              appendActivity,
+              "The event remains safely stored and recovery controls remain available.",
+              "warning",
+            );
           }
-          setWorkflowState("needs_attention");
-          appendActivity("Receipt Service rejected the delivery");
           activeRun.current = null;
           return;
         }
@@ -180,86 +398,141 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         await sleep(pollIntervalMs, controller.signal);
       }
     },
-    [appendActivity, eventrail, refreshMetrics],
+    [appendActivity, eventrail, refreshMetrics, showToast],
   );
 
   const runDemo = useCallback(() => {
     abortActiveRun();
+    const parsedAmount = parseAmount(transaction.amount);
+    if (parsedAmount === null) {
+      setErrorMessage("Amount must be a positive whole-dollar value for this demo");
+      return;
+    }
+    const invoiceID = transaction.invoiceID.trim();
+    if (invoiceID === "") {
+      setErrorMessage("Invoice ID is required");
+      return;
+    }
+
     const controller = new AbortController();
     activeRun.current = controller;
     setMode("live");
     setBackendAvailable(true);
     setWorkflowState("configuring_destination");
+    setSubmittedEventID(null);
     setEventStatus(null);
     setDLQDetail(null);
-    setMetrics(null);
-    setMockStats(null);
     setTriage(null);
     setTriageUnavailable(false);
+    clearExplanation();
     setActivity([]);
+    clearToasts();
     setErrorMessage(null);
     setFixedDestination(false);
     activityID.current = 0;
 
     void (async () => {
       try {
-        appendActivity("Configuring Receipt Service");
-        if (selectedKey === "temporary") {
-          await destination.setMode("healthy", 1, controller.signal);
-        } else if (selectedKey === "validation" || selectedKey === "recovered") {
-          await destination.setMode("validation_failure", 0, controller.signal);
-        } else {
-          await destination.setMode("healthy", 0, controller.signal);
-        }
+        await refreshMetrics(controller.signal);
+        appendActivity(
+          "Preparing Receipt Service...",
+          behaviorDetail(transaction.behavior),
+          "neutral",
+        );
+        await configureDestination(destination, transaction.behavior, controller.signal);
+        const stats = await destination.getStats(controller.signal);
+        setMockStats(stats);
 
         setWorkflowState("creating_event");
-        appendActivity("Invoice payment event submitted for receipt delivery");
-        const created = await eventrail.createEvent(
-          {
-            event_type: "webhook",
-            source: "Payment Service",
-            payload: {
-              url: destination.receiptsURL(),
-              data: {
-                business_event_type: "invoice.paid",
-                invoice_id: "INV-2048",
-                amount: 500,
-                currency: "USD",
-              },
+        appendActivity(
+          "Payment event submitted",
+          `Invoice ${invoiceID} is being sent for receipt delivery.`,
+          "active",
+        );
+        const request = {
+          event_type: "webhook",
+          source: "Payment Service",
+          payload: {
+            url: destination.receiptsURL(),
+            data: {
+              business_event_type: "invoice.paid",
+              invoice_id: invoiceID,
+              amount: parsedAmount,
+              currency: transaction.currency,
             },
           },
-          `dashboard-${selectedKey}-${Date.now()}`,
+        };
+        const created = await eventrail.createEvent(
+          request,
+          `dashboard-${invoiceID}-${Date.now()}`,
           controller.signal,
         );
-        appendActivity("Tracking EventRail status");
+        setSubmittedEventID(created.id);
+        appendActivity(
+          `EventRail accepted event ${shortEventID(created.id)}`,
+          "Polling the live status endpoint for this exact event ID.",
+          "success",
+        );
+        showToast("event-accepted", "EventRail accepted the event", "success");
+        await refreshMetrics(controller.signal);
         setWorkflowState("tracking");
         await pollStatus(created.id, controller);
       } catch (error) {
         if (controller.signal.aborted) {
-          appendActivity("Previous demo cancelled");
           return;
         }
         setWorkflowState("failed");
         setBackendAvailable(false);
         setErrorMessage(error instanceof Error ? error.message : "Demo run failed");
-        appendActivity("Demo stopped because a request failed");
+        appendActivity(
+          "Request failure",
+          "Live progress stopped because a required service request failed.",
+          "danger",
+        );
+        showToast("request-failure", "Live demo request failed", "danger");
         activeRun.current = null;
       }
     })();
-  }, [abortActiveRun, appendActivity, destination, eventrail, pollStatus, selectedKey]);
+  }, [
+    abortActiveRun,
+    appendActivity,
+    clearExplanation,
+    clearToasts,
+    destination,
+    eventrail,
+    pollStatus,
+    refreshMetrics,
+    showToast,
+    transaction,
+  ]);
+
+  const startNewEvent = useCallback(() => {
+    resetEventSpecificState(newTransactionForm());
+  }, [resetEventSpecificState]);
 
   const openFixturePreview = useCallback(() => {
     abortActiveRun();
+    clearExplanation();
     setMode("fixture");
     setWorkflowState("idle");
     setErrorMessage(null);
-  }, [abortActiveRun]);
+  }, [abortActiveRun, clearExplanation]);
 
   const fixDestination = useCallback(() => {
+    const eventID = eventStatus?.event_id ?? dlqDetail?.event_id ?? submittedEventID;
+    if (!eventID) {
+      return;
+    }
+
+    const previousState = workflowState;
     const controller = new AbortController();
     setWorkflowState("fixing_destination");
     setErrorMessage(null);
-    appendActivity("Setting Receipt Service back to healthy");
+    appendActivity(
+      "Correcting destination",
+      "The operator is setting the Receipt Service back to healthy behavior.",
+      "active",
+    );
 
     void destination
       .setMode("healthy", 0, controller.signal)
@@ -267,17 +540,33 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
       .then((stats) => {
         setMockStats(stats);
         setFixedDestination(true);
-        setWorkflowState("needs_attention");
-        appendActivity("Receipt Service is healthy; redrive is ready for operator approval");
+        setWorkflowState(previousState === "triage_ready" ? "triage_ready" : "needs_attention");
+        appendOnce(
+          eventID,
+          "Destination configuration corrected",
+          appendActivity,
+          "Receipt Service will now accept the redriven delivery.",
+          "success",
+        );
+        showToast("destination-corrected", "Destination corrected", "success");
       })
       .catch((error) => {
-        setWorkflowState("failed");
+        setWorkflowState(previousState);
         setErrorMessage(error instanceof Error ? error.message : "Fix destination failed");
+        appendActivity("Destination correction failed", "The DLQ event remains recoverable.", "danger");
       });
-  }, [appendActivity, destination]);
+  }, [
+    appendActivity,
+    destination,
+    dlqDetail?.event_id,
+    eventStatus?.event_id,
+    showToast,
+    submittedEventID,
+    workflowState,
+  ]);
 
   const redriveEvent = useCallback(() => {
-    const eventID = eventStatus?.event_id ?? dlqDetail?.event_id;
+    const eventID = eventStatus?.event_id ?? dlqDetail?.event_id ?? submittedEventID;
     if (!eventID) {
       return;
     }
@@ -286,38 +575,106 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     const controller = new AbortController();
     activeRun.current = controller;
     setWorkflowState("redriving");
-    appendActivity("Operator redrive accepted");
+    setErrorMessage(null);
 
     void (async () => {
       try {
         await eventrail.redrive(eventID, controller.signal);
-        appendActivity("Receipt delivery restarted");
+        appendOnce(
+          eventID,
+          "Redrive accepted",
+          appendActivity,
+          "EventRail is sending the original event again after operator approval.",
+          "active",
+        );
+        showToast("redrive-accepted", "Redrive accepted", "neutral");
+        await refreshMetrics(controller.signal);
         await pollStatus(eventID, controller);
       } catch (error) {
         if (controller.signal.aborted) {
           return;
         }
-        setWorkflowState("failed");
+        setWorkflowState(fixedDestination ? "triage_ready" : "needs_attention");
         setErrorMessage(error instanceof Error ? error.message : "Redrive failed");
-        appendActivity("Redrive failed");
+        appendActivity("Redrive request failed", "The DLQ event remains available.", "danger");
+        showToast("request-failure", "Redrive failed", "danger");
         activeRun.current = null;
       }
     })();
-  }, [abortActiveRun, appendActivity, dlqDetail?.event_id, eventStatus?.event_id, eventrail, pollStatus]);
+  }, [
+    abortActiveRun,
+    appendActivity,
+    dlqDetail?.event_id,
+    eventStatus?.event_id,
+    eventrail,
+    fixedDestination,
+    pollStatus,
+    refreshMetrics,
+    showToast,
+    submittedEventID,
+  ]);
 
   const scenario = useMemo(() => {
-    if (mode === "fixture" || !eventStatus) {
+    if (mode === "fixture") {
       return fixtureScenario;
     }
     return liveScenarioFromStatus(
-      fixtureScenario,
+      transaction,
+      submittedEventID,
       eventStatus,
       dlqDetail,
       metrics,
       triage,
       triageUnavailable,
     );
-  }, [dlqDetail, eventStatus, fixtureScenario, metrics, mode, triage, triageUnavailable]);
+  }, [
+    dlqDetail,
+    eventStatus,
+    fixtureScenario,
+    metrics,
+    mode,
+    submittedEventID,
+    transaction,
+    triage,
+    triageUnavailable,
+  ]);
+
+  const technicalDetails = useMemo(() => {
+    if (mode !== "live" || !submittedEventID) {
+      return null;
+    }
+    const effective = dlqDetail ?? eventStatus;
+    return {
+      eventId: submittedEventID,
+      eventRailType: effective?.event_type ?? "webhook",
+      businessEventType: "invoice.paid",
+      source: effective?.source ?? "Payment Service",
+      destination: "Receipt Service",
+      currentStatus: effective?.current_status ?? workflowState,
+      attemptCount: effective?.delivery_attempts.length ?? 0,
+      analysisMode: explanation?.analysis_mode ?? triage?.analysis_mode,
+      provider: explanation?.provider ?? triage?.provider,
+      model: explanation?.model ?? triage?.model,
+      explanationRecoveryStatus: explanation?.recovery_status,
+      explanationCitationChunkIDs: explanation?.citations.map((citation) => citation.chunk_id),
+      metadata: [
+        `Invoice ID: ${transaction.invoiceID.trim()}`,
+        `Amount: ${formatCurrency(transaction.amount, transaction.currency)}`,
+        `Destination host: ${new URL(destination.receiptsURL()).host}`,
+        `Mock behavior: ${behaviorLabel(transaction.behavior)}`,
+      ],
+    };
+  }, [
+    destination,
+    dlqDetail,
+    eventStatus,
+    explanation,
+    mode,
+    submittedEventID,
+    transaction,
+    triage,
+    workflowState,
+  ]);
 
   return {
     scenario,
@@ -325,28 +682,46 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     backendAvailable,
     connectionText:
       backendAvailable === null
-        ? "Checking backend"
+        ? "Checking live EventRail"
         : backendAvailable
           ? "Live backend connected"
-          : "Backend unavailable",
+          : "Live EventRail unavailable",
     workflowState,
+    transaction,
     activity,
-    eventID: eventStatus?.event_id ?? dlqDetail?.event_id ?? null,
+    toasts,
+    eventID: submittedEventID,
     mockStats,
+    technicalDetails,
+    explanation,
+    explanationLoading,
+    explanationError,
+    explanationGeneratedFor,
+    explanationStale,
+    canExplainEvent,
     isRunActive:
       workflowState === "configuring_destination" ||
       workflowState === "creating_event" ||
       workflowState === "tracking" ||
       workflowState === "retrying" ||
+      workflowState === "triage_loading" ||
       workflowState === "fixing_destination" ||
       workflowState === "redriving",
-    canRecover: workflowState === "needs_attention",
-    canRedrive: workflowState === "needs_attention" && fixedDestination,
+    canRecover:
+      mode === "live" && (workflowState === "needs_attention" || workflowState === "triage_ready"),
+    canRedrive:
+      mode === "live" &&
+      (workflowState === "needs_attention" || workflowState === "triage_ready") &&
+      fixedDestination,
     errorMessage,
+    updateTransaction,
     runDemo,
+    startNewEvent,
     openFixturePreview,
     fixDestination,
     redriveEvent,
+    explainCurrentEvent,
+    clearExplanation,
     refreshConnection,
   };
 }
@@ -354,17 +729,61 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
 function updateWorkflowFromStatus(
   status: EventStatusResponse,
   setWorkflowState: (state: LiveWorkflowState) => void,
-  appendActivity: (message: string) => void,
+  appendActivity: (
+    message: string,
+    detail?: string,
+    tone?: ActivityEntry["tone"],
+    time?: string,
+  ) => void,
+  showToast: (key: string, message: string, tone?: ToastMessage["tone"]) => void,
 ) {
   const statuses = status.history.map((entry) => entry.status);
+  const eventID = status.event_id;
   if (statuses.includes("STORED") || statuses.includes("PENDING_PUBLICATION")) {
-    appendOnce(status.event_id, "Event safely stored", appendActivity);
+    appendOnce(
+      eventID,
+      "Event stored durably",
+      appendActivity,
+      "The event was recorded before asynchronous delivery began.",
+      "success",
+      latestHistoryTime(status.history, "STORED") ??
+        latestHistoryTime(status.history, "PENDING_PUBLICATION"),
+    );
+    showToast("stored", "Event stored durably", "success");
   }
   if (statuses.includes("PUBLISHED")) {
-    appendOnce(status.event_id, "Receipt delivery started", appendActivity);
+    appendOnce(
+      eventID,
+      "Publication completed",
+      appendActivity,
+      "The delivery worker can now process this event.",
+      "active",
+      latestHistoryTime(status.history, "PUBLISHED"),
+    );
+  }
+  for (const attempt of status.delivery_attempts) {
+    appendAttemptActivity(eventID, attempt, appendActivity);
   }
   if (statuses.includes("RETRYING")) {
-    appendOnce(status.event_id, "Temporary failure queued for retry", appendActivity);
+    appendOnce(
+      eventID,
+      "Automatic retry scheduled",
+      appendActivity,
+      "EventRail will try delivery again.",
+      "warning",
+      latestHistoryTime(status.history, "RETRYING"),
+    );
+    showToast("retry-scheduled", "Automatic retry scheduled", "warning");
+  }
+  if (statuses.includes("REDRIVEN")) {
+    appendOnce(
+      eventID,
+      "Redriven status observed",
+      appendActivity,
+      "The backend recorded operator redrive for this event.",
+      "active",
+      latestHistoryTime(status.history, "REDRIVEN"),
+    );
   }
   if (status.current_status === "DELIVERED") {
     setWorkflowState("delivered");
@@ -377,35 +796,87 @@ function updateWorkflowFromStatus(
 
 const seenActivity = new Set<string>();
 
-function appendOnce(eventID: string, message: string, appendActivity: (message: string) => void) {
+function appendOnce(
+  eventID: string,
+  message: string,
+  appendActivity: (
+    message: string,
+    detail?: string,
+    tone?: ActivityEntry["tone"],
+    time?: string,
+  ) => void,
+  detail?: string,
+  tone?: ActivityEntry["tone"],
+  time?: string,
+) {
   const key = `${eventID}:${message}`;
   if (seenActivity.has(key)) {
     return;
   }
   seenActivity.add(key);
-  appendActivity(message);
+  appendActivity(message, detail, tone, time);
+}
+
+function appendAttemptActivity(
+  eventID: string,
+  attempt: DeliveryAttemptResponse,
+  appendActivity: (
+    message: string,
+    detail?: string,
+    tone?: ActivityEntry["tone"],
+    time?: string,
+  ) => void,
+) {
+  const code = attempt.response_code;
+  if (!code) {
+    return;
+  }
+  const time = formatTime(attempt.completed_at);
+  if (code >= 200 && code < 300) {
+    appendOnce(
+      eventID,
+      `Delivery attempt ${attempt.attempt_number} succeeded`,
+      appendActivity,
+      `${httpStatusLabel(code)} from Receipt Service.`,
+      "success",
+      time,
+    );
+    return;
+  }
+  appendOnce(
+    eventID,
+    `Delivery attempt ${attempt.attempt_number} failed with HTTP ${code}`,
+    appendActivity,
+    code >= 500
+      ? "Temporary failure. EventRail scheduled another attempt."
+      : "Permanent failure. EventRail moved the event to operator recovery.",
+    code >= 500 ? "warning" : "danger",
+    time,
+  );
 }
 
 function liveScenarioFromStatus(
-  fixture: DemoScenario,
-  status: EventStatusResponse,
+  transaction: LiveTransactionForm,
+  submittedEventID: string | null,
+  status: EventStatusResponse | null,
   dlq: EventStatusResponse | null,
   metrics: MetricsSummaryResponse | null,
   triage: TriageResponse | null,
   triageUnavailable: boolean,
 ): DemoScenario {
   const effective = dlq ?? status;
-  const summaryStatus = toInternalStatus(effective.current_status);
+  const summaryStatus = toInternalStatus(effective?.current_status ?? "RECEIVED");
   return {
-    ...fixture,
+    key: "healthy",
+    controlLabel: "Live",
+    title: "Live payment event",
     summaryStatus,
-    metrics: metrics ? metricsFromSummary(metrics) : fixture.metrics,
-    event: {
-      ...fixture.event,
-      eventId: effective.event_id,
-    },
-    timeline: timelineFromHistory(effective.history, summaryStatus),
-    attempts: attemptsFromStatus(effective.delivery_attempts),
+    metrics: metrics ? metricsFromSummary(metrics) : pendingMetrics(),
+    event: liveBusinessEvent(transaction, submittedEventID, effective),
+    timeline: effective
+      ? timelineFromHistory(effective.history, summaryStatus)
+      : timeline([], "RECEIVED"),
+    attempts: effective ? attemptsFromStatus(effective.delivery_attempts, transaction) : [],
     aiTriage: triage
       ? aiTriageFromResponse(triage)
       : triageUnavailable
@@ -414,16 +885,44 @@ function liveScenarioFromStatus(
   };
 }
 
+function liveBusinessEvent(
+  transaction: LiveTransactionForm,
+  submittedEventID: string | null,
+  status: EventStatusResponse | null,
+): BusinessEvent {
+  return {
+    invoiceNumber: transaction.invoiceID.trim() || "Invoice not set",
+    amount: formatCurrency(transaction.amount, transaction.currency),
+    label: "Invoice paid",
+    businessEventType: "invoice.paid",
+    deliveryType: status?.event_type ?? "webhook",
+    deliveryMethod: "Webhook",
+    source: status?.source ?? "Payment Service",
+    destination: "Receipt Service",
+    eventId: submittedEventID ?? "Not submitted yet",
+    createdAt: firstHistoryTime(status?.history) ?? "Awaiting backend timestamp",
+  };
+}
+
 function metricsFromSummary(summary: MetricsSummaryResponse): Metric[] {
   return [
-    { label: "Events processed", value: summary.total_events.toLocaleString(), tone: "neutral" },
-    { label: "Successfully delivered", value: summary.delivered.toLocaleString(), tone: "success" },
-    { label: "Recovering automatically", value: summary.retrying.toLocaleString(), tone: "warning" },
+    { label: "Local demo events", value: summary.total_events.toLocaleString(), tone: "neutral" },
+    { label: "Delivered events", value: summary.delivered.toLocaleString(), tone: "success" },
+    { label: "Retry attempts", value: summary.retrying.toLocaleString(), tone: "warning" },
     {
       label: "Needs attention",
       value: summary.open_dlq.toLocaleString(),
       tone: summary.open_dlq > 0 ? "danger" : "success",
     },
+  ];
+}
+
+function pendingMetrics(): Metric[] {
+  return [
+    { label: "Local demo events", value: "-", tone: "neutral" },
+    { label: "Delivered events", value: "-", tone: "success" },
+    { label: "Retry attempts", value: "-", tone: "warning" },
+    { label: "Needs attention", value: "-", tone: "neutral" },
   ];
 }
 
@@ -439,7 +938,10 @@ function timelineFromHistory(
   return timeline([...active], current);
 }
 
-function attemptsFromStatus(attempts: DeliveryAttemptResponse[]): DeliveryAttempt[] {
+function attemptsFromStatus(
+  attempts: DeliveryAttemptResponse[],
+  transaction: LiveTransactionForm,
+): DeliveryAttempt[] {
   return attempts.map((attempt) => {
     const code = attempt.response_code;
     const result: DeliveryAttempt["result"] =
@@ -452,9 +954,9 @@ function attemptsFromStatus(attempts: DeliveryAttemptResponse[]): DeliveryAttemp
       attemptNumber: attempt.attempt_number,
       time: formatTime(attempt.completed_at),
       result,
-      httpStatus: code ? String(code) : "pending",
+      httpStatus: code ? httpStatusLabel(code) : "pending",
       message: messageForAttempt(result, code),
-      detail: detailForAttempt(result, code),
+      detail: detailForAttempt(result, code, transaction.invoiceID.trim()),
     };
   });
 }
@@ -463,23 +965,14 @@ function aiTriageFromStatus(status: InternalStatus): AITriage {
   if (status === "DEAD_LETTERED") {
     return {
       state: "advisory",
-      headline: "Local deterministic analysis",
+      headline: "Exception guidance not requested yet.",
       analysisMode: "deterministic_runbook",
       provider: "deterministic",
       model: null,
-      whyItFailed:
-        "The Receipt Service rejected the event because receipt validation did not pass.",
-      recommendedChecks: [
-        "Verify the payment-to-receipt field mapping.",
-        "Confirm invoice_id is included before delivery.",
-        "Validate the destination schema version.",
-      ],
+      whyItFailed: "The event is in the DLQ and ready for grounded analysis.",
+      recommendedChecks: ["Request exception guidance before redriving."],
       redriveReadiness: "Not ready",
-      redriveExplanation: "Fix the destination validation condition before redriving this event.",
-      trustedSource: {
-        label: "Receipt Validation Runbook",
-        citation: "receipt-validation-v1/checks",
-      },
+      redriveExplanation: "Fix or verify the destination condition before redrive.",
     };
   }
   if (status === "DELIVERED") {
@@ -540,8 +1033,6 @@ function aiTriageUnavailable(): AITriage {
     analysisMode: "deterministic_fallback",
     provider: "deterministic",
     model: null,
-    fallbackMessage:
-      "The configured model provider was unavailable or returned an invalid result. Trusted runbook guidance is shown instead.",
     whyItFailed:
       "EventRail could not reach the grounded triage service. The event remains durable in the DLQ.",
     recommendedChecks: [
@@ -576,6 +1067,42 @@ function headlineForCategory(category: string): string {
   }
 }
 
+function configureDestination(
+  destination: MockDestinationClient,
+  behavior: ReceiptBehavior,
+  signal: AbortSignal,
+) {
+  if (behavior === "temporary") {
+    return destination.setMode("healthy", 1, signal);
+  }
+  if (behavior === "validation") {
+    return destination.setMode("validation_failure", 0, signal);
+  }
+  return destination.setMode("healthy", 0, signal);
+}
+
+function behaviorDetail(behavior: ReceiptBehavior): string {
+  switch (behavior) {
+    case "temporary":
+      return "The next receipt request will fail once with a temporary outage.";
+    case "validation":
+      return "The Receipt Service will reject delivery with a permanent validation error.";
+    default:
+      return "The Receipt Service will accept delivery.";
+  }
+}
+
+function behaviorLabel(behavior: ReceiptBehavior): string {
+  switch (behavior) {
+    case "temporary":
+      return "Temporary outage";
+    case "validation":
+      return "Validation rejection";
+    default:
+      return "Healthy delivery";
+  }
+}
+
 function messageForAttempt(result: DeliveryAttempt["result"], code: number | null): string {
   if (result === "Delivered") {
     return "Receipt Service confirmed delivery";
@@ -586,14 +1113,18 @@ function messageForAttempt(result: DeliveryAttempt["result"], code: number | nul
   return "Receipt Service rejected the event";
 }
 
-function detailForAttempt(result: DeliveryAttempt["result"], code: number | null): string {
+function detailForAttempt(
+  result: DeliveryAttempt["result"],
+  code: number | null,
+  invoiceID: string,
+): string {
   if (result === "Delivered") {
-    return "The receipt was applied once for invoice INV-2048.";
+    return `The receipt was applied for invoice ${invoiceID || "the submitted invoice"}.`;
   }
   if (code && code >= 500) {
-    return "EventRail scheduled automatic recovery without losing the event.";
+    return "Temporary failure. EventRail scheduled another attempt.";
   }
-  return "Receipt validation failed and automatic recovery stopped safely.";
+  return "Receipt Service rejected the delivery with a permanent validation failure.";
 }
 
 function toInternalStatus(status: string): InternalStatus {
@@ -623,6 +1154,144 @@ function toTimelineStatus(status: string): InternalStatus {
     default:
       return "RECEIVED";
   }
+}
+
+function firstHistoryTime(history?: EventStatusResponse["history"]): string | null {
+  if (!history || history.length === 0) {
+    return null;
+  }
+  return formatTime(history[0].created_at);
+}
+
+function latestHistoryTime(
+  history: EventStatusResponse["history"],
+  status: string,
+): string | undefined {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    if (history[index].status === status) {
+      return formatTime(history[index].created_at);
+    }
+  }
+  return undefined;
+}
+
+function explanationFingerprint(
+  eventID: string | null,
+  status: EventStatusResponse | null,
+  dlq: EventStatusResponse | null,
+  fixedDestination: boolean,
+): string | null {
+  if (!eventID) {
+    return null;
+  }
+  const effective = dlq ?? status;
+  if (!effective || (effective.history.length === 0 && effective.delivery_attempts.length === 0)) {
+    return null;
+  }
+  const latestAttempt = effective.delivery_attempts.at(-1);
+  const statusNames = effective.history.map((entry) => entry.status);
+  return [
+    eventID,
+    effective.current_status,
+    effective.delivery_attempts.length,
+    latestAttempt?.attempt_number ?? "none",
+    latestAttempt?.response_code ?? "none",
+    latestAttempt?.outcome ?? "none",
+    statusNames.includes("RETRYING") ? "retried" : "not-retried",
+    statusNames.includes("DEAD_LETTERED") ? "dlq" : "not-dlq",
+    statusNames.includes("REDRIVEN") ? "redriven" : "not-redriven",
+    statusNames.includes("DELIVERED") || effective.current_status === "DELIVERED"
+      ? "delivered"
+      : "not-delivered",
+    fixedDestination ? "destination-fixed" : "destination-not-fixed",
+  ].join("|");
+}
+
+function explainErrorMessage(error: unknown): string {
+  if (error instanceof APIError) {
+    switch (error.status) {
+      case 400:
+        return "Unable to explain this event because its identifier is invalid.";
+      case 404:
+        return "This event could not be found.";
+      case 409:
+        return "More event history is needed before Event Intelligence can explain it.";
+      case 502:
+        return "Event Intelligence returned an invalid response.";
+      case 503:
+        return "Event Intelligence is temporarily unavailable.";
+      default:
+        return "Event Intelligence unavailable.";
+    }
+  }
+  return "EventRail could not reach Event Intelligence.";
+}
+
+function httpStatusLabel(code: number): string {
+  const text = httpStatusText[code];
+  return text ? `${code} ${text}` : String(code);
+}
+
+const httpStatusText: Record<number, string> = {
+  200: "OK",
+  400: "Bad Request",
+  401: "Unauthorized",
+  403: "Forbidden",
+  404: "Not Found",
+  408: "Request Timeout",
+  429: "Too Many Requests",
+  500: "Internal Server Error",
+  502: "Bad Gateway",
+  503: "Service Unavailable",
+  504: "Gateway Timeout",
+};
+
+function parseAmount(value: string): number | null {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatCurrency(amount: string, currency: LiveTransactionForm["currency"]): string {
+  const parsed = Number(amount);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return `${amount || "-"} ${currency}`;
+  }
+  const formatted = new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency,
+  }).format(parsed);
+  return `${formatted} ${currency}`;
+}
+
+function newTransactionForm(): LiveTransactionForm {
+  return {
+    invoiceID: generateInvoiceID(),
+    amount: "500",
+    currency: "USD",
+    behavior: "validation",
+  };
+}
+
+function generateInvoiceID(): string {
+  return `INV-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+function shortEventID(eventID: string): string {
+  if (eventID.length <= 12) {
+    return eventID;
+  }
+  return `${eventID.slice(0, 8)}...${eventID.slice(-4)}`;
+}
+
+function currentTime(): string {
+  return new Date().toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function formatTime(value: string): string {

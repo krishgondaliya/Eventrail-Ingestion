@@ -4,7 +4,7 @@ param(
     [string]$Command = "status",
 
     [switch]$NoBrowser,
-    [switch]$UseOllama,
+    [switch]$UseOpenAI,
     [switch]$SkipAI,
     [switch]$Force
 )
@@ -15,11 +15,36 @@ Set-StrictMode -Version Latest
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Paths = Get-DemoPaths -Root $Root
 
+function Get-OpenAIDemoModel {
+    $configured = [string]$env:OPENAI_MODEL
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        return "gpt-5.4-mini"
+    }
+    return $configured.Trim()
+}
+
+function Get-OpenAIDemoTimeoutSeconds {
+    $configured = [string]$env:OPENAI_TIMEOUT_SECONDS
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        return "30"
+    }
+    return $configured.Trim()
+}
+
+function ConvertTo-PowerShellSingleQuotedValue {
+    param([string]$Value)
+
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
 function Start-Demo {
     param([switch]$Fresh)
 
-    if ($UseOllama -and $SkipAI) {
-        throw "Use either -UseOllama or -SkipAI, not both."
+    if ($UseOpenAI -and $SkipAI) {
+        throw "Use either -UseOpenAI or -SkipAI, not both."
+    }
+    if ($UseOpenAI -and [string]::IsNullOrWhiteSpace([string]$env:OPENAI_API_KEY)) {
+        throw "OPENAI_API_KEY is required for OpenAI Event Intelligence."
     }
 
     $paths = Ensure-DemoDirectories -Root $Root
@@ -50,21 +75,14 @@ function Start-Demo {
         return
     }
 
-    if ($UseOllama) {
-        Assert-CommandAvailable -Name "ollama"
-        $models = ollama list
-        if (-not ($models -match "qwen3:4b")) {
-            throw "Ollama model qwen3:4b is not installed. Run without -UseOllama or install it manually with 'ollama pull qwen3:4b'."
-        }
-    }
-
     Ensure-PythonDependencies
     Ensure-DashboardDependencies
 
     $started = @{}
     $state = [ordered]@{
         started_at = (Get-Date).ToString("o")
-        ai_mode = if ($SkipAI) { "skipped" } elseif ($UseOllama) { "ollama" } else { "deterministic" }
+        ai_mode = if ($SkipAI) { "skipped" } elseif ($UseOpenAI) { "openai" } else { "deterministic" }
+        event_intelligence_model = if ($UseOpenAI) { Get-OpenAIDemoModel } else { $null }
         processes = [ordered]@{}
     }
 
@@ -110,10 +128,12 @@ function Start-Demo {
             $state.processes["ai_service"] = @{ skipped = $true }
             Write-Host "[4/6] AI Triage skipped"
         } else {
-            $aiModeCommand = if ($UseOllama) {
-                "`$env:TRIAGE_PROVIDER='ollama'; `$env:OLLAMA_BASE_URL='http://127.0.0.1:11434'; `$env:OLLAMA_MODEL='qwen3:4b'; `$env:OLLAMA_TIMEOUT_SECONDS='90'; python -m uvicorn eventrail_ai.api:app --host 127.0.0.1 --port 8090"
+            $aiModeCommand = if ($UseOpenAI) {
+                $openAIModel = ConvertTo-PowerShellSingleQuotedValue -Value (Get-OpenAIDemoModel)
+                $openAITimeout = ConvertTo-PowerShellSingleQuotedValue -Value (Get-OpenAIDemoTimeoutSeconds)
+                "`$env:TRIAGE_PROVIDER='deterministic'; `$env:EXPLAIN_PROVIDER='openai'; `$env:OPENAI_MODEL=$openAIModel; `$env:OPENAI_TIMEOUT_SECONDS=$openAITimeout; python -m uvicorn eventrail_ai.api:app --host 127.0.0.1 --port 8090"
             } else {
-                "`$env:TRIAGE_PROVIDER='deterministic'; python -m uvicorn eventrail_ai.api:app --host 127.0.0.1 --port 8090"
+                "`$env:TRIAGE_PROVIDER='deterministic'; `$env:EXPLAIN_PROVIDER='deterministic'; python -m uvicorn eventrail_ai.api:app --host 127.0.0.1 --port 8090"
             }
             $ai = Start-AppProcess `
                 -Name "ai" `
@@ -123,7 +143,7 @@ function Start-Demo {
             $started["ai_service"] = $ai.Id
             $state.processes["ai_service"] = @{ pid = $ai.Id }
 
-            $aiWaitSeconds = if ($UseOllama) { 90 } else { 60 }
+            $aiWaitSeconds = 60
             Wait-Until -Name "AI Triage" -TimeoutSeconds $aiWaitSeconds -Check { Test-HttpHealthy -Url "http://127.0.0.1:8090/health/live" }
             Write-Host "[4/6] AI Triage ready"
         }
@@ -140,7 +160,7 @@ function Start-Demo {
         Wait-Until -Name "EventRail API" -Check { Test-HttpHealthy -Url "http://127.0.0.1:8080/health/ready" }
         Write-Host "[5/6] EventRail API ready"
 
-        $dashboardCommand = "`$env:VITE_EVENTRAIL_API_URL='http://127.0.0.1:8080'; `$env:VITE_MOCK_DESTINATION_URL='http://127.0.0.1:8081'; npm run dev -- --host 127.0.0.1"
+        $dashboardCommand = "`$env:VITE_EVENTRAIL_API_URL='http://127.0.0.1:8080'; `$env:VITE_MOCK_DESTINATION_URL='http://127.0.0.1:8081'; & '.\node_modules\.bin\vite.cmd' --host 127.0.0.1"
         $dashboard = Start-AppProcess `
             -Name "dashboard" `
             -Command $dashboardCommand `
@@ -233,7 +253,8 @@ function Show-StartSummary {
         [switch]$Fresh
     )
 
-    $aiMode = if ($SkipAI) { "Skipped" } elseif ($UseOllama) { "Local Ollama" } else { "Deterministic" }
+    $exceptionGuidance = if ($SkipAI) { "Skipped" } else { "Deterministic" }
+    $eventIntelligence = if ($SkipAI) { "Skipped" } elseif ($UseOpenAI) { "OpenAI ($(Get-OpenAIDemoModel))" } else { "Deterministic" }
     Write-Host ""
     if ($Fresh) {
         Write-Host "Fresh EventRail demo is ready."
@@ -247,8 +268,11 @@ function Show-StartSummary {
     Write-Host "EventRail API:"
     Write-Host "http://127.0.0.1:8080"
     Write-Host ""
-    Write-Host "AI mode:"
-    Write-Host $aiMode
+    Write-Host "Exception Guidance:"
+    Write-Host $exceptionGuidance
+    Write-Host ""
+    Write-Host "Event Intelligence:"
+    Write-Host $eventIntelligence
     Write-Host ""
     Write-Host "Logs:"
     Write-Host $Paths.LogDir

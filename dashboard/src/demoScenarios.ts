@@ -10,6 +10,7 @@ const event: BusinessEvent = {
   source: "Payment Service",
   destination: "Receipt Service",
   eventId: "6f1f4f9e-7f48-4c1d-8bcb-91d31a0b2048",
+  createdAt: "Fixture timestamp",
 };
 
 const importantDescriptions = {
@@ -38,7 +39,14 @@ export function timeline(
   return steps.map((id) => ({
     id,
     description: importantDescriptions[id as keyof typeof importantDescriptions],
-    state: id === current ? "current" : activeStatuses.includes(id) ? "complete" : "future",
+    state:
+      id === current
+        ? "current"
+        : activeStatuses.includes(id)
+          ? "complete"
+          : current === "DELIVERED" && (id === "RETRYING" || id === "DEAD_LETTERED" || id === "REDRIVEN")
+            ? "skipped"
+            : "future",
   }));
 }
 

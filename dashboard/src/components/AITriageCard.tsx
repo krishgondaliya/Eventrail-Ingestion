@@ -8,11 +8,11 @@ export function AITriageCard({ triage }: AITriageCardProps) {
   const badge = badgeForMode(triage);
 
   return (
-    <section className={`ai-card ai-${triage.state}`} aria-labelledby="ai-title">
+    <section className={`ai-card ai-${triage.state}`} aria-labelledby="guidance-title">
       <div className="ai-heading">
         <div>
           <p className="section-kicker">Advisory guidance</p>
-          <h2 id="ai-title">AI Exception Assistant</h2>
+          <h2 id="guidance-title">Exception Guidance</h2>
         </div>
         <span className="badge badge-neutral">{badge}</span>
       </div>
@@ -98,8 +98,8 @@ function providerLabel(provider: AITriage["provider"]): string {
 }
 
 function modelLabel(model: string): string {
-  if (model.toLowerCase() === "qwen3:4b") {
-    return "Qwen3 4B";
+  if (model.toLowerCase() === "gpt-5.4-mini") {
+    return "GPT-5.4 Mini";
   }
   return model;
 }
