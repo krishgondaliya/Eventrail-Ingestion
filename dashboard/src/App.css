@@ -9,6 +9,7 @@
 .timeline-panel,
 .detail-card,
 .ai-card,
+.event-intelligence-card,
 .demo-controls,
 .guided-banner,
 .business-outcome,
@@ -71,6 +72,7 @@ h4 {
 .summary-main,
 .attempt-topline,
 .ai-heading,
+.event-intelligence-heading,
 .demo-controls {
   display: flex;
   align-items: center;
@@ -844,7 +846,8 @@ dd {
 }
 
 .detail-card,
-.ai-card {
+.ai-card,
+.event-intelligence-card {
   padding: 22px;
 }
 
@@ -914,6 +917,132 @@ dd {
 
 .ai-card {
   border-color: #c9d8ee;
+}
+
+.event-intelligence-card {
+  display: grid;
+  gap: 16px;
+  border-color: #b8d9d0;
+  border-top: 5px solid #0f8a65;
+}
+
+.event-intelligence-heading {
+  align-items: flex-start;
+}
+
+.intelligence-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.intelligence-empty p,
+.intelligence-loading p,
+.intelligence-error p,
+.intelligence-result p,
+.intelligence-result li {
+  color: #4e5f77;
+  line-height: 1.5;
+}
+
+.intelligence-empty p,
+.intelligence-loading p,
+.intelligence-error p {
+  margin-bottom: 0;
+}
+
+.intelligence-loading,
+.intelligence-error,
+.stale-note,
+.recovery-summary {
+  padding: 12px;
+  border: 1px solid #dfe7ef;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.intelligence-loading {
+  border-color: #c9d8ee;
+  background: #eef5ff;
+}
+
+.intelligence-error {
+  border-color: #f0c3bd;
+  background: #fff2f0;
+}
+
+.intelligence-error strong {
+  color: #a52a1c;
+}
+
+.stale-note {
+  margin: 0;
+  border-color: #f0d9a7;
+  background: #fff8e8;
+  color: #755217;
+  font-weight: 800;
+}
+
+.intelligence-result {
+  display: grid;
+  gap: 14px;
+}
+
+.intelligence-result ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.recovery-summary {
+  background: #f0fbf6;
+  border-color: #9dd9bf;
+}
+
+.recovery-summary span,
+.citation-list small {
+  display: block;
+  color: #607084;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.recovery-summary strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 1.08rem;
+}
+
+.citation-list {
+  display: grid;
+  gap: 8px;
+  padding-left: 0 !important;
+  list-style: none;
+}
+
+.citation-list li {
+  padding: 10px 12px;
+  border: 1px solid #dfe7ef;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.citation-list span {
+  display: block;
+  color: #172033;
+  font-weight: 800;
+}
+
+.citation-list small {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  text-transform: none;
+}
+
+.intelligence-actions {
+  display: flex;
+  justify-content: flex-start;
 }
 
 .ai-advisory {

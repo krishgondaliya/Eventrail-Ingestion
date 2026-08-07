@@ -89,6 +89,53 @@ export interface AITriage {
   };
 }
 
+export type ExplanationRecoveryStatus =
+  | "not_needed"
+  | "not_ready"
+  | "review_required"
+  | "completed";
+
+export type ExplanationAnalysisMode =
+  | "deterministic_runbook"
+  | "llm_grounded"
+  | "deterministic_fallback";
+
+export type ExplanationProvider = "deterministic" | "openai" | "ollama";
+
+export type ExplanationEvidenceType =
+  | "event_status"
+  | "delivery_attempt"
+  | "retry"
+  | "dlq"
+  | "redrive"
+  | "delivery_outcome";
+
+export interface EventExplanationEvidence {
+  type: ExplanationEvidenceType;
+  description: string;
+}
+
+export interface EventExplanationCitation {
+  runbook_id: string;
+  chunk_id: string;
+  title: string;
+  source_path: string;
+}
+
+export interface EventExplanation {
+  headline: string;
+  what_happened: string;
+  business_impact: string;
+  next_action: string;
+  recommended_actions: string[];
+  recovery_status: ExplanationRecoveryStatus;
+  evidence: EventExplanationEvidence[];
+  citations: EventExplanationCitation[];
+  analysis_mode: ExplanationAnalysisMode;
+  provider: ExplanationProvider;
+  model: string | null;
+}
+
 export interface DemoScenario {
   key: ScenarioKey;
   controlLabel: string;
@@ -127,5 +174,7 @@ export interface TechnicalDetails {
   analysisMode?: string;
   provider?: string;
   model?: string | null;
+  explanationRecoveryStatus?: string;
+  explanationCitationChunkIDs?: string[];
   metadata: string[];
 }

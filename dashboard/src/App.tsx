@@ -7,6 +7,7 @@ import { BusinessOutcomeCard } from "./components/BusinessOutcomeCard";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { DemoControls } from "./components/DemoControls";
 import { DemoRunPanel } from "./components/DemoRunPanel";
+import { EventIntelligenceCard } from "./components/EventIntelligenceCard";
 import { EventSummary } from "./components/EventSummary";
 import { EventTimeline } from "./components/EventTimeline";
 import { GuidedDemoBanner } from "./components/GuidedDemoBanner";
@@ -63,6 +64,16 @@ function App() {
       <EventTimeline steps={demo.scenario.timeline} />
       <section className="insight-grid" aria-label="Delivery details and AI guidance">
         <AttemptHistory attempts={demo.scenario.attempts} />
+        <EventIntelligenceCard
+          mode={demo.mode}
+          eventID={demo.eventID}
+          canExplain={demo.canExplainEvent}
+          explanation={demo.explanation}
+          loading={demo.explanationLoading}
+          stale={demo.explanationStale}
+          error={demo.explanationError}
+          onExplain={demo.explainCurrentEvent}
+        />
         <AITriageCard triage={demo.scenario.aiTriage} />
       </section>
       <ActivityFeed activity={demo.activity} />

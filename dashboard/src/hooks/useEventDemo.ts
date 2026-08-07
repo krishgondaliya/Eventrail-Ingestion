@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { APIError } from "../api/errors";
 import {
   EventRailClient,
   type DeliveryAttemptResponse,
@@ -20,6 +21,7 @@ import type {
   DeliveryAttempt,
   DemoMode,
   DemoScenario,
+  EventExplanation,
   InternalStatus,
   LiveTransactionForm,
   LiveWorkflowState,
@@ -45,6 +47,12 @@ export interface EventDemoState {
   eventID: string | null;
   mockStats: MockDestinationStats | null;
   technicalDetails: TechnicalDetails | null;
+  explanation: EventExplanation | null;
+  explanationLoading: boolean;
+  explanationError: string | null;
+  explanationGeneratedFor: string | null;
+  explanationStale: boolean;
+  canExplainEvent: boolean;
   isRunActive: boolean;
   canRecover: boolean;
   canRedrive: boolean;
@@ -58,6 +66,8 @@ export interface EventDemoState {
   openFixturePreview: () => void;
   fixDestination: () => void;
   redriveEvent: () => void;
+  explainCurrentEvent: () => void;
+  clearExplanation: () => void;
   refreshConnection: () => void;
 }
 
@@ -75,11 +85,16 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
   const [mockStats, setMockStats] = useState<MockDestinationStats | null>(null);
   const [triage, setTriage] = useState<TriageResponse | null>(null);
   const [triageUnavailable, setTriageUnavailable] = useState(false);
+  const [explanation, setExplanation] = useState<EventExplanation | null>(null);
+  const [explanationLoading, setExplanationLoading] = useState(false);
+  const [explanationError, setExplanationError] = useState<string | null>(null);
+  const [explanationGeneratedFor, setExplanationGeneratedFor] = useState<string | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [fixedDestination, setFixedDestination] = useState(false);
   const activeRun = useRef<AbortController | null>(null);
+  const activeExplanation = useRef<AbortController | null>(null);
   const activityID = useRef(0);
   const toastID = useRef(0);
   const seenToastKeys = useRef(new Set<string>());
@@ -141,6 +156,19 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     activeRun.current = null;
   }, []);
 
+  const abortActiveExplanation = useCallback(() => {
+    activeExplanation.current?.abort();
+    activeExplanation.current = null;
+  }, []);
+
+  const clearExplanation = useCallback(() => {
+    abortActiveExplanation();
+    setExplanation(null);
+    setExplanationLoading(false);
+    setExplanationError(null);
+    setExplanationGeneratedFor(null);
+  }, [abortActiveExplanation]);
+
   const refreshMetrics = useCallback(
     async (signal?: AbortSignal) => {
       try {
@@ -180,9 +208,10 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
   useEffect(() => {
     return () => {
       abortActiveRun();
+      abortActiveExplanation();
       clearToasts();
     };
-  }, [abortActiveRun, clearToasts]);
+  }, [abortActiveExplanation, abortActiveRun, clearToasts]);
 
   const resetEventSpecificState = useCallback(
     (nextTransaction?: LiveTransactionForm) => {
@@ -194,6 +223,7 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
       setDLQDetail(null);
       setTriage(null);
       setTriageUnavailable(false);
+      clearExplanation();
       setActivity([]);
       clearToasts();
       setErrorMessage(null);
@@ -203,7 +233,7 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         setTransaction(nextTransaction);
       }
     },
-    [abortActiveRun, clearToasts],
+    [abortActiveRun, clearExplanation, clearToasts],
   );
 
   const updateTransaction = useCallback(
@@ -212,6 +242,85 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     },
     [],
   );
+
+  const currentExplanationFingerprint = useMemo(
+    () => explanationFingerprint(submittedEventID, eventStatus, dlqDetail, fixedDestination),
+    [dlqDetail, eventStatus, fixedDestination, submittedEventID],
+  );
+  const canExplainEvent = mode === "live" && currentExplanationFingerprint !== null;
+  const explanationStale =
+    explanation !== null &&
+    explanationGeneratedFor !== null &&
+    currentExplanationFingerprint !== null &&
+    explanationGeneratedFor !== currentExplanationFingerprint;
+
+  const explainCurrentEvent = useCallback(() => {
+    const eventID = submittedEventID;
+    const fingerprint = currentExplanationFingerprint;
+    if (!eventID || !fingerprint) {
+      setExplanationError("More event history is needed before Event Intelligence can explain it.");
+      return;
+    }
+
+    abortActiveExplanation();
+    const controller = new AbortController();
+    const replacingStaleExplanation = explanation !== null && explanationStale;
+    activeExplanation.current = controller;
+    setExplanationLoading(true);
+    setExplanationError(null);
+
+    void eventrail
+      .explainEvent(eventID, controller.signal)
+      .then((response) => {
+        setExplanation(response);
+        setExplanationGeneratedFor(fingerprint);
+        setExplanationError(null);
+        appendOnce(
+          `${eventID}:${fingerprint}`,
+          replacingStaleExplanation ? "Event Intelligence refreshed" : "Event Intelligence ready",
+          appendActivity,
+          replacingStaleExplanation
+            ? "The explanation now includes the latest retry or recovery outcome."
+            : "A grounded explanation of the current delivery history is available.",
+          "active",
+        );
+        showToast(
+          replacingStaleExplanation
+            ? `event-explanation-updated:${eventID}:${fingerprint}`
+            : `event-explanation-ready:${eventID}:${fingerprint}`,
+          replacingStaleExplanation ? "Event explanation updated" : "Event explanation ready",
+          "neutral",
+        );
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setExplanationError(explainErrorMessage(error));
+        showToast(
+          `event-explanation-failed:${eventID}:${fingerprint}`,
+          "Event Intelligence unavailable",
+          "warning",
+        );
+      })
+      .finally(() => {
+        if (activeExplanation.current === controller) {
+          activeExplanation.current = null;
+        }
+        if (!controller.signal.aborted) {
+          setExplanationLoading(false);
+        }
+      });
+  }, [
+    abortActiveExplanation,
+    appendActivity,
+    currentExplanationFingerprint,
+    eventrail,
+    explanation,
+    explanationStale,
+    showToast,
+    submittedEventID,
+  ]);
 
   const pollStatus = useCallback(
     async (eventID: string, controller: AbortController) => {
@@ -315,6 +424,7 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     setDLQDetail(null);
     setTriage(null);
     setTriageUnavailable(false);
+    clearExplanation();
     setActivity([]);
     clearToasts();
     setErrorMessage(null);
@@ -386,6 +496,7 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
   }, [
     abortActiveRun,
     appendActivity,
+    clearExplanation,
     clearToasts,
     destination,
     eventrail,
@@ -401,10 +512,11 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
 
   const openFixturePreview = useCallback(() => {
     abortActiveRun();
+    clearExplanation();
     setMode("fixture");
     setWorkflowState("idle");
     setErrorMessage(null);
-  }, [abortActiveRun]);
+  }, [abortActiveRun, clearExplanation]);
 
   const fixDestination = useCallback(() => {
     const eventID = eventStatus?.event_id ?? dlqDetail?.event_id ?? submittedEventID;
@@ -540,9 +652,11 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
       destination: "Receipt Service",
       currentStatus: effective?.current_status ?? workflowState,
       attemptCount: effective?.delivery_attempts.length ?? 0,
-      analysisMode: triage?.analysis_mode,
-      provider: triage?.provider,
-      model: triage?.model,
+      analysisMode: explanation?.analysis_mode ?? triage?.analysis_mode,
+      provider: explanation?.provider ?? triage?.provider,
+      model: explanation?.model ?? triage?.model,
+      explanationRecoveryStatus: explanation?.recovery_status,
+      explanationCitationChunkIDs: explanation?.citations.map((citation) => citation.chunk_id),
       metadata: [
         `Invoice ID: ${transaction.invoiceID.trim()}`,
         `Amount: ${formatCurrency(transaction.amount, transaction.currency)}`,
@@ -550,7 +664,17 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
         `Mock behavior: ${behaviorLabel(transaction.behavior)}`,
       ],
     };
-  }, [destination, dlqDetail, eventStatus, mode, submittedEventID, transaction, triage, workflowState]);
+  }, [
+    destination,
+    dlqDetail,
+    eventStatus,
+    explanation,
+    mode,
+    submittedEventID,
+    transaction,
+    triage,
+    workflowState,
+  ]);
 
   return {
     scenario,
@@ -569,6 +693,12 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     eventID: submittedEventID,
     mockStats,
     technicalDetails,
+    explanation,
+    explanationLoading,
+    explanationError,
+    explanationGeneratedFor,
+    explanationStale,
+    canExplainEvent,
     isRunActive:
       workflowState === "configuring_destination" ||
       workflowState === "creating_event" ||
@@ -590,6 +720,8 @@ export function useEventDemo(selectedKey: ScenarioKey): EventDemoState {
     openFixturePreview,
     fixDestination,
     redriveEvent,
+    explainCurrentEvent,
+    clearExplanation,
     refreshConnection,
   };
 }
@@ -1041,6 +1173,58 @@ function latestHistoryTime(
     }
   }
   return undefined;
+}
+
+function explanationFingerprint(
+  eventID: string | null,
+  status: EventStatusResponse | null,
+  dlq: EventStatusResponse | null,
+  fixedDestination: boolean,
+): string | null {
+  if (!eventID) {
+    return null;
+  }
+  const effective = dlq ?? status;
+  if (!effective || (effective.history.length === 0 && effective.delivery_attempts.length === 0)) {
+    return null;
+  }
+  const latestAttempt = effective.delivery_attempts.at(-1);
+  const statusNames = effective.history.map((entry) => entry.status);
+  return [
+    eventID,
+    effective.current_status,
+    effective.delivery_attempts.length,
+    latestAttempt?.attempt_number ?? "none",
+    latestAttempt?.response_code ?? "none",
+    latestAttempt?.outcome ?? "none",
+    statusNames.includes("RETRYING") ? "retried" : "not-retried",
+    statusNames.includes("DEAD_LETTERED") ? "dlq" : "not-dlq",
+    statusNames.includes("REDRIVEN") ? "redriven" : "not-redriven",
+    statusNames.includes("DELIVERED") || effective.current_status === "DELIVERED"
+      ? "delivered"
+      : "not-delivered",
+    fixedDestination ? "destination-fixed" : "destination-not-fixed",
+  ].join("|");
+}
+
+function explainErrorMessage(error: unknown): string {
+  if (error instanceof APIError) {
+    switch (error.status) {
+      case 400:
+        return "Unable to explain this event because its identifier is invalid.";
+      case 404:
+        return "This event could not be found.";
+      case 409:
+        return "More event history is needed before Event Intelligence can explain it.";
+      case 502:
+        return "Event Intelligence returned an invalid response.";
+      case 503:
+        return "Event Intelligence is temporarily unavailable.";
+      default:
+        return "Event Intelligence unavailable.";
+    }
+  }
+  return "EventRail could not reach Event Intelligence.";
 }
 
 function httpStatusLabel(code: number): string {

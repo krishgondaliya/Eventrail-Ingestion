@@ -59,7 +59,23 @@ export function TechnicalDetails({ details }: TechnicalDetailsProps) {
             <dd>{details.model}</dd>
           </div>
         ) : null}
+        {details.explanationRecoveryStatus ? (
+          <div>
+            <dt>Explanation recovery status</dt>
+            <dd>{details.explanationRecoveryStatus}</dd>
+          </div>
+        ) : null}
       </dl>
+      {details.explanationCitationChunkIDs && details.explanationCitationChunkIDs.length > 0 ? (
+        <section className="technical-citations" aria-label="Explanation citation chunk IDs">
+          <h3>Explanation citations</h3>
+          <ul>
+            {details.explanationCitationChunkIDs.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       <ul>
         {details.metadata.map((item) => (
           <li key={item}>{item}</li>
