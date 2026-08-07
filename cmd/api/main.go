@@ -217,11 +217,16 @@ func main() {
 	}
 	mux.HandleFunc("/events", httpapi.NewCreateEventHandler(persist))
 	eventStatusHandler := httpapi.NewEventStatusHandler(operationsStore)
+	eventExplainHandler := httpapi.NewEventExplainHandler(operationsStore, aiTriageClient)
 
 	// --------------------
 	// GET /events/{id}
 	// --------------------
 	mux.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/explain") {
+			eventExplainHandler.ServeHTTP(w, r)
+			return
+		}
 		if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") {
 			eventStatusHandler.ServeHTTP(w, r)
 			return
