@@ -63,7 +63,10 @@ export interface DeliveryAttempt {
 export interface AITriage {
   state: "calm" | "advisory" | "success";
   headline: string;
-  analysisLabel?: string;
+  analysisMode?: "fixture" | "deterministic_runbook" | "llm_grounded" | "deterministic_fallback";
+  provider?: "deterministic" | "openai" | "ollama";
+  model?: string | null;
+  fallbackMessage?: string;
   whyItFailed?: string;
   recommendedChecks?: string[];
   redriveReadiness: "Ready" | "Not ready" | "Review required" | "No action needed";

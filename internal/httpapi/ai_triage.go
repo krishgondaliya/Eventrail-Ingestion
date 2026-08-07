@@ -33,6 +33,8 @@ type triageResponse struct {
 	RedriveRecommendation string           `json:"redrive_recommendation"`
 	Citations             []triageCitation `json:"citations"`
 	AnalysisMode          string           `json:"analysis_mode"`
+	Provider              string           `json:"provider"`
+	Model                 *string          `json:"model"`
 }
 
 type triageCitation struct {
@@ -44,7 +46,7 @@ type triageCitation struct {
 
 func NewAITriageClient(baseURL string, client *http.Client) *AITriageClient {
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	return &AITriageClient{
 		baseURL: strings.TrimRight(baseURL, "/"),

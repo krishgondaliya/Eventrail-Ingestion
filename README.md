@@ -32,6 +32,19 @@ docker pull ghcr.io/krishgondaliya/eventrail:latest
 
 ---
 
+## Local demo
+
+```powershell
+.\scripts\demo.ps1 start
+.\scripts\demo.ps1 status
+.\scripts\demo.ps1 reset -Force
+.\scripts\demo.ps1 stop
+```
+
+Use reset before interview practice to remove previous local events and start from a fresh environment.
+
+---
+
 ## Architecture Overview
 
 ```

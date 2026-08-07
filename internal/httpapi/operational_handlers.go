@@ -215,7 +215,7 @@ func handleDLQTriage(w http.ResponseWriter, r *http.Request, store DLQStore, tri
 
 	triage, err := triageClient.Triage(r.Context(), triageRequestFromDLQDetail(detail))
 	if err != nil {
-		http.Error(w, "failed to generate AI triage", http.StatusBadGateway)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "TRIAGE_UNAVAILABLE"})
 		return
 	}
 	writeJSON(w, http.StatusOK, triage)

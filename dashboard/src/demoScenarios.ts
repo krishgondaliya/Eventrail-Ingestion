@@ -69,6 +69,7 @@ export const demoScenarios: DemoScenario[] = [
     aiTriage: {
       state: "calm",
       headline: "No operator investigation required.",
+      analysisMode: "fixture",
       redriveReadiness: "No action needed",
       redriveExplanation: "Delivery completed successfully on the first attempt.",
     },
@@ -107,6 +108,7 @@ export const demoScenarios: DemoScenario[] = [
     aiTriage: {
       state: "success",
       headline: "Automatic recovery succeeded.",
+      analysisMode: "fixture",
       redriveReadiness: "No action needed",
       redriveExplanation: "No human action is required because the retry delivered the receipt.",
     },
@@ -137,6 +139,7 @@ export const demoScenarios: DemoScenario[] = [
     aiTriage: {
       state: "advisory",
       headline: "Advisory guidance",
+      analysisMode: "fixture",
       whyItFailed:
         "The Receipt Service rejected the event because the required invoice_id field was missing.",
       recommendedChecks: [
@@ -189,6 +192,7 @@ export const demoScenarios: DemoScenario[] = [
     aiTriage: {
       state: "success",
       headline: "Issue corrected and redrive succeeded.",
+      analysisMode: "fixture",
       whyItFailed: "The original receipt was missing invoice_id; the corrected event was approved.",
       redriveReadiness: "Ready",
       redriveExplanation: "Human-approved redrive succeeded and the receipt was applied once.",
