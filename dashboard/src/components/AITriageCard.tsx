@@ -5,6 +5,8 @@ interface AITriageCardProps {
 }
 
 export function AITriageCard({ triage }: AITriageCardProps) {
+  const badge = badgeForMode(triage);
+
   return (
     <section className={`ai-card ai-${triage.state}`} aria-labelledby="ai-title">
       <div className="ai-heading">
@@ -12,10 +14,19 @@ export function AITriageCard({ triage }: AITriageCardProps) {
           <p className="section-kicker">Advisory guidance</p>
           <h2 id="ai-title">AI Exception Assistant</h2>
         </div>
-        <span className="badge badge-neutral">{triage.analysisLabel ?? "Trusted runbooks"}</span>
+        <span className="badge badge-neutral">{badge}</span>
       </div>
 
       <div className="ai-body">
+        {triage.provider ? (
+          <p className="provider-note">
+            Provider: {providerLabel(triage.provider)}
+            {triage.model ? ` / Model: ${modelLabel(triage.model)}` : ""}
+          </p>
+        ) : null}
+        {triage.fallbackMessage ? (
+          <p className="fallback-note">{triage.fallbackMessage}</p>
+        ) : null}
         <h3>{triage.headline}</h3>
         {triage.whyItFailed ? (
           <section>
@@ -54,7 +65,41 @@ export function AITriageCard({ triage }: AITriageCardProps) {
         ) : null}
       </div>
 
-      <p className="ai-disclaimer">AI guidance does not change or redrive the event automatically.</p>
+      <p className="ai-disclaimer">Advisory only. This analysis cannot modify or redrive the event.</p>
     </section>
   );
+}
+
+function badgeForMode(triage: AITriage): string {
+  switch (triage.analysisMode) {
+    case "llm_grounded":
+      return triage.provider === "ollama" ? "Local LLM grounded analysis" : "LLM grounded analysis";
+    case "deterministic_fallback":
+      return "Deterministic fallback";
+    case "deterministic_runbook":
+      return "Deterministic runbook analysis";
+    case "fixture":
+      return "Fixture analysis";
+    default:
+      return "Deterministic runbook analysis";
+  }
+}
+
+function providerLabel(provider: AITriage["provider"]): string {
+  switch (provider) {
+    case "openai":
+      return "OpenAI";
+    case "ollama":
+      return "Ollama";
+    case "deterministic":
+    default:
+      return "Deterministic";
+  }
+}
+
+function modelLabel(model: string): string {
+  if (model.toLowerCase() === "qwen3:4b") {
+    return "Qwen3 4B";
+  }
+  return model;
 }

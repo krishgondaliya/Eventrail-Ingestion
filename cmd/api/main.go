@@ -112,7 +112,9 @@ func main() {
 		log.Fatalf("failed to apply PostgreSQL migrations: %v", err)
 	}
 	operationsStore := operations.NewStore(pgPool)
-	aiTriageClient := httpapi.NewAITriageClient(cfg.AIServiceURL, nil)
+	aiTriageClient := httpapi.NewAITriageClient(cfg.AIServiceURL, &http.Client{
+		Timeout: cfg.AIServiceTimeout,
+	})
 
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,

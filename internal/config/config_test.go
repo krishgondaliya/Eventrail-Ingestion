@@ -65,6 +65,9 @@ func TestLoadUsesDefaultsForUnsetOptionalValues(t *testing.T) {
 	if got.AIServiceURL != "http://127.0.0.1:8090" {
 		t.Fatalf("expected default AI service URL, got %q", got.AIServiceURL)
 	}
+	if got.AIServiceTimeout != 10*time.Second {
+		t.Fatalf("expected default AI service timeout 10s, got %v", got.AIServiceTimeout)
+	}
 	if got.ConsumerName != "api-1" {
 		t.Fatalf("expected default consumer api-1, got %q", got.ConsumerName)
 	}
@@ -153,6 +156,21 @@ func TestLoadRejectsInvalidDurationValues(t *testing.T) {
 			key:   "OUTBOX_POLL_INTERVAL_MS",
 			value: "-20",
 		},
+		{
+			name:  "invalid AI_SERVICE_TIMEOUT_MS",
+			key:   "AI_SERVICE_TIMEOUT_MS",
+			value: "later",
+		},
+		{
+			name:  "zero AI_SERVICE_TIMEOUT_MS",
+			key:   "AI_SERVICE_TIMEOUT_MS",
+			value: "0",
+		},
+		{
+			name:  "negative AI_SERVICE_TIMEOUT_MS",
+			key:   "AI_SERVICE_TIMEOUT_MS",
+			value: "-100",
+		},
 	}
 
 	for _, tt := range tests {
@@ -179,6 +197,7 @@ func TestLoadParsesValidOverrides(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", secretTestDSN)
 	t.Setenv("REDIS_ADDR", "redis:6379")
 	t.Setenv("AI_SERVICE_URL", "http://ai-service:8090")
+	t.Setenv("AI_SERVICE_TIMEOUT_MS", "1500")
 	t.Setenv("CONSUMER_NAME", "worker-7")
 	t.Setenv("MAX_RETRIES", "9")
 	t.Setenv("BASE_BACKOFF_MS", "1250")
@@ -197,6 +216,9 @@ func TestLoadParsesValidOverrides(t *testing.T) {
 	}
 	if got.AIServiceURL != "http://ai-service:8090" {
 		t.Fatalf("expected AI service URL override, got %q", got.AIServiceURL)
+	}
+	if got.AIServiceTimeout != 1500*time.Millisecond {
+		t.Fatalf("expected AI service timeout override, got %v", got.AIServiceTimeout)
 	}
 	if got.ConsumerName != "worker-7" {
 		t.Fatalf("expected consumer worker-7, got %q", got.ConsumerName)
@@ -234,6 +256,7 @@ func clearConfigEnv(t *testing.T) {
 		"POSTGRES_DSN",
 		"REDIS_ADDR",
 		"AI_SERVICE_URL",
+		"AI_SERVICE_TIMEOUT_MS",
 		"CONSUMER_NAME",
 		"MAX_RETRIES",
 		"BASE_BACKOFF_MS",

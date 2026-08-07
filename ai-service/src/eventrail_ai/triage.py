@@ -1,17 +1,31 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from eventrail_ai.embeddings import DeterministicHashEmbeddingProvider, EmbeddingProvider
 from eventrail_ai.retrieval import IndexedChunk, RetrievalResult, build_index, retrieve
 from eventrail_ai.runbooks import RunbookChunk, load_and_chunk_runbooks
 
 RedriveRecommendation = Literal["not_ready", "review_required"]
-AnalysisMode = Literal["deterministic_runbook"]
+AnalysisMode = Literal["deterministic_runbook", "llm_grounded", "deterministic_fallback"]
+ProviderName = Literal["deterministic", "openai", "ollama"]
+TriageCategory = Literal[
+    "destination_validation_error",
+    "authentication_error",
+    "authorization_error",
+    "rate_limited",
+    "destination_outage",
+    "schema_error",
+    "routing_configuration_error",
+    "unknown",
+]
+
+logger = logging.getLogger(__name__)
 
 
 class TriageRequest(BaseModel):
@@ -39,12 +53,54 @@ class Citation(BaseModel):
 class TriageDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    category: str
-    summary: str
-    recommended_actions: list[str]
+    category: TriageCategory
+    summary: str = Field(min_length=1, max_length=500)
+    recommended_actions: list[str] = Field(min_length=1, max_length=5)
     redrive_recommendation: RedriveRecommendation
-    citations: list[Citation]
+    citations: list[Citation] = Field(min_length=1)
     analysis_mode: AnalysisMode = "deterministic_runbook"
+    provider: ProviderName = "deterministic"
+    model: str | None = None
+
+    @field_validator("recommended_actions")
+    @classmethod
+    def _validate_actions(cls, actions: list[str]) -> list[str]:
+        for action in actions:
+            if not action.strip():
+                raise ValueError("recommended actions must be nonempty")
+            if len(action) > 250:
+                raise ValueError("recommended actions must be 250 characters or fewer")
+        return actions
+
+
+class LLMTriageDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: TriageCategory
+    summary: str = Field(min_length=1, max_length=500)
+    recommended_actions: list[str] = Field(min_length=1, max_length=5)
+    redrive_recommendation: RedriveRecommendation
+    citation_chunk_ids: list[str] = Field(min_length=1, max_length=3)
+
+    @field_validator("recommended_actions")
+    @classmethod
+    def _validate_actions(cls, actions: list[str]) -> list[str]:
+        for action in actions:
+            if not action.strip():
+                raise ValueError("recommended actions must be nonempty")
+            if len(action) > 250:
+                raise ValueError("recommended actions must be 250 characters or fewer")
+        return actions
+
+    @field_validator("citation_chunk_ids")
+    @classmethod
+    def _validate_citation_ids(cls, citation_ids: list[str]) -> list[str]:
+        if len(citation_ids) != len(set(citation_ids)):
+            raise ValueError("citation IDs must not contain duplicates")
+        for citation_id in citation_ids:
+            if not citation_id.strip():
+                raise ValueError("citation IDs must be nonempty")
+        return citation_ids
 
 
 class TriageEngine:
@@ -52,6 +108,7 @@ class TriageEngine:
         self,
         *,
         provider: object,
+        fallback_provider: object | None = None,
         runbooks_dir: Path | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         load_chunks: Callable[[Path], Sequence[RunbookChunk]] = load_and_chunk_runbooks,
@@ -60,6 +117,7 @@ class TriageEngine:
         ] = build_index,
     ) -> None:
         self._provider = provider
+        self._fallback_provider = fallback_provider
         self._embedding_provider = embedding_provider or DeterministicHashEmbeddingProvider(
             dimensions=128
         )
@@ -84,14 +142,45 @@ class TriageEngine:
                 decision = TriageDecision.model_validate(decision)
             _validate_decision(decision, retrieved)
         except Exception:  # noqa: BLE001 - unsafe provider output must degrade safely.
+            if self._fallback_provider is not None:
+                return self._fallback(request, retrieved)
             return safe_unknown_fallback(retrieved)
         return decision
 
+    def _fallback(
+        self,
+        request: TriageRequest,
+        retrieved: Sequence[RetrievalResult],
+    ) -> TriageDecision:
+        provider_name = getattr(self._provider, "provider_name", "unknown")
+        model_name = getattr(self._provider, "model", None)
+        logger.warning(
+            "triage provider failed; using deterministic fallback provider=%s model=%s",
+            provider_name,
+            model_name,
+        )
+        try:
+            decision = self._fallback_provider.generate(request, retrieved)  # type: ignore[union-attr]
+            if not isinstance(decision, TriageDecision):
+                decision = TriageDecision.model_validate(decision)
+            decision = decision.model_copy(
+                update={
+                    "analysis_mode": "deterministic_fallback",
+                    "provider": "deterministic",
+                    "model": None,
+                }
+            )
+            _validate_decision(decision, retrieved)
+            return decision
+        except Exception:  # noqa: BLE001 - deterministic safety fallback must not 500.
+            fallback = safe_unknown_fallback(retrieved)
+            return fallback.model_copy(update={"analysis_mode": "deterministic_fallback"})
+
 
 def create_default_engine() -> TriageEngine:
-    from eventrail_ai.triage_provider import DeterministicTriageProvider
+    from eventrail_ai.triage_provider import create_engine_from_environment
 
-    return TriageEngine(provider=DeterministicTriageProvider())
+    return create_engine_from_environment()
 
 
 def default_runbooks_dir() -> Path:
@@ -178,5 +267,18 @@ def _contains_forbidden_phrase(decision: TriageDecision) -> bool:
         "autonomous redrive",
         "bypass validation",
         "ignore authentication",
+        "disable authentication",
+        "skip authorization",
+        "send credentials",
     )
     return any(phrase in haystack for phrase in forbidden)
+
+
+def retrieved_citation_from_chunk_id(
+    chunk_id: str,
+    retrieved: Sequence[RetrievalResult],
+) -> Citation:
+    for result in retrieved:
+        if result.chunk.chunk_id == chunk_id:
+            return citation_from_result(result)
+    raise ValueError(f"citation chunk ID was not retrieved: {chunk_id}")

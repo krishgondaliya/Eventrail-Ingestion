@@ -14,12 +14,14 @@ const (
 	defaultBaseBackoffMS      = 500
 	defaultOutboxPollInterval = 250
 	defaultAIServiceURL       = "http://127.0.0.1:8090"
+	defaultAIServiceTimeoutMS = 10000
 )
 
 type Config struct {
 	PostgresDSN        string
 	RedisAddr          string
 	AIServiceURL       string
+	AIServiceTimeout   time.Duration
 	ConsumerName       string
 	MaxRetries         int
 	BaseBackoff        time.Duration
@@ -57,11 +59,16 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	aiServiceTimeoutMS, err := optionalPositiveInt("AI_SERVICE_TIMEOUT_MS", defaultAIServiceTimeoutMS)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		PostgresDSN:        postgresDSN,
 		RedisAddr:          redisAddr,
 		AIServiceURL:       aiServiceURL,
+		AIServiceTimeout:   time.Duration(aiServiceTimeoutMS) * time.Millisecond,
 		ConsumerName:       consumerName,
 		MaxRetries:         maxRetries,
 		BaseBackoff:        time.Duration(baseBackoffMS) * time.Millisecond,

@@ -69,7 +69,9 @@ export interface TriageResponse {
   recommended_actions: string[];
   redrive_recommendation: "not_ready" | "review_required";
   citations: TriageCitationResponse[];
-  analysis_mode: string;
+  analysis_mode: "deterministic_runbook" | "llm_grounded" | "deterministic_fallback";
+  provider: "deterministic" | "openai" | "ollama";
+  model: string | null;
 }
 
 export interface MetricsSummaryResponse {

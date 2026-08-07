@@ -33,6 +33,14 @@ type fakeTriageClient struct {
 	calls    int
 }
 
+func TestAITriageClientDefaultTimeoutIsTenSeconds(t *testing.T) {
+	client := NewAITriageClient("http://ai.example.test", nil)
+
+	if client.client.Timeout != 10*time.Second {
+		t.Fatalf("expected default timeout 10s, got %v", client.client.Timeout)
+	}
+}
+
 func (c *fakeTriageClient) Triage(_ context.Context, request triageRequest) (triageResponse, error) {
 	c.calls++
 	c.request = request
@@ -223,6 +231,8 @@ func TestDLQTriageSendsSanitizedMetadataToAIService(t *testing.T) {
 			Summary:               "The Receipt Service rejected the delivery because invoice_id was missing.",
 			RecommendedActions:    []string{"Verify the payment-to-receipt field mapping."},
 			RedriveRecommendation: "not_ready",
+			Provider:              "openai",
+			Model:                 stringPtr("gpt-5-test"),
 			Citations: []triageCitation{{
 				RunbookID:  "receipt-validation-v1",
 				ChunkID:    "receipt-validation-v1/checks",
@@ -311,6 +321,8 @@ func TestDLQTriageReturnsAIResponse(t *testing.T) {
 			RecommendedActions:    []string{"Verify field mapping."},
 			RedriveRecommendation: "not_ready",
 			AnalysisMode:          "deterministic_runbook",
+			Provider:              "deterministic",
+			Model:                 nil,
 		},
 	}
 	store := &fakeOperationalStore{
@@ -334,9 +346,12 @@ func TestDLQTriageReturnsAIResponse(t *testing.T) {
 	if got.Category != "destination_validation_error" || got.Summary != "Grounded triage summary." {
 		t.Fatalf("unexpected triage response: %#v", got)
 	}
+	if got.Provider != "deterministic" || got.Model != nil {
+		t.Fatalf("unexpected provider metadata: %#v", got)
+	}
 }
 
-func TestDLQTriageFailureDoesNotAffectDLQDetail(t *testing.T) {
+func TestDLQTriageUnavailableDoesNotAffectDLQDetail(t *testing.T) {
 	store := &fakeOperationalStore{
 		dlqDetail: operations.DLQDetail{
 			Record: operations.DLQRecord{EventID: "event-1", Status: operations.DLQStatusOpen},
@@ -345,14 +360,23 @@ func TestDLQTriageFailureDoesNotAffectDLQDetail(t *testing.T) {
 	client := &fakeTriageClient{err: errors.New("ai unavailable")}
 
 	triage := performOperationalRequest(NewDLQHandler(store, nil, client), http.MethodPost, "/dlq/event-1/triage")
-	if triage.Code != http.StatusBadGateway {
-		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, triage.Code)
+	if triage.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, triage.Code)
+	}
+	var unavailable map[string]string
+	decodeJSONResponse(t, triage, &unavailable)
+	if unavailable["error"] != "TRIAGE_UNAVAILABLE" {
+		t.Fatalf("expected TRIAGE_UNAVAILABLE response, got %#v", unavailable)
 	}
 
 	detail := performOperationalRequest(NewDLQHandler(store, nil, client), http.MethodGet, "/dlq/event-1")
 	if detail.Code != http.StatusOK {
 		t.Fatalf("expected DLQ detail to remain available, got %d", detail.Code)
 	}
+}
+
+func stringPtr(value string) *string {
+	return &value
 }
 
 func TestDLQTriageRejectsNonPost(t *testing.T) {

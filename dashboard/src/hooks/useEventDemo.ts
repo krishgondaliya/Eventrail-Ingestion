@@ -464,7 +464,9 @@ function aiTriageFromStatus(status: InternalStatus): AITriage {
     return {
       state: "advisory",
       headline: "Local deterministic analysis",
-      analysisLabel: "Local deterministic analysis",
+      analysisMode: "deterministic_runbook",
+      provider: "deterministic",
+      model: null,
       whyItFailed:
         "The Receipt Service rejected the event because receipt validation did not pass.",
       recommendedChecks: [
@@ -484,7 +486,9 @@ function aiTriageFromStatus(status: InternalStatus): AITriage {
     return {
       state: "success",
       headline: "No operator investigation required.",
-      analysisLabel: "Local deterministic analysis",
+      analysisMode: "deterministic_runbook",
+      provider: "deterministic",
+      model: null,
       redriveReadiness: "No action needed",
       redriveExplanation: "The live EventRail workflow reached Delivered.",
     };
@@ -492,7 +496,9 @@ function aiTriageFromStatus(status: InternalStatus): AITriage {
   return {
     state: "calm",
     headline: "Delivery is still in progress.",
-    analysisLabel: "Local deterministic analysis",
+    analysisMode: "deterministic_runbook",
+    provider: "deterministic",
+    model: null,
     redriveReadiness: "No action needed",
     redriveExplanation: "EventRail is still tracking delivery for this event.",
   };
@@ -503,7 +509,13 @@ function aiTriageFromResponse(response: TriageResponse): AITriage {
   return {
     state: "advisory",
     headline: headlineForCategory(response.category),
-    analysisLabel: response.analysis_mode,
+    analysisMode: response.analysis_mode,
+    provider: response.provider,
+    model: response.model,
+    fallbackMessage:
+      response.analysis_mode === "deterministic_fallback"
+        ? "The configured model provider was unavailable or returned an invalid result. Trusted runbook guidance is shown instead."
+        : undefined,
     whyItFailed: response.summary,
     recommendedChecks: response.recommended_actions,
     redriveReadiness:
@@ -525,7 +537,11 @@ function aiTriageUnavailable(): AITriage {
   return {
     state: "advisory",
     headline: "Automated analysis unavailable.",
-    analysisLabel: "Unavailable",
+    analysisMode: "deterministic_fallback",
+    provider: "deterministic",
+    model: null,
+    fallbackMessage:
+      "The configured model provider was unavailable or returned an invalid result. Trusted runbook guidance is shown instead.",
     whyItFailed:
       "EventRail could not reach the grounded triage service. The event remains durable in the DLQ.",
     recommendedChecks: [
